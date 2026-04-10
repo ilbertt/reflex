@@ -11,6 +11,7 @@ directly. No reasoning, no monologue. That's the "reflex" thesis.
 
 import argparse
 import json
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -19,9 +20,15 @@ from pathlib import Path
 DEFAULT_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 
 
-def write_mlx_dataset(in_path: Path, out_dir: Path) -> int:
+def write_mlx_dataset(in_path: Path, out_dir: Path, epochs: int) -> int:
     """Translate our {image, instruction, action} jsonl into mlx_vlm.lora's
     expected {image, question, answer} schema with absolute image paths.
+
+    Pre-duplicates the dataset by `epochs` (shuffled per pass), because
+    mlx_vlm.lora's --epochs flag is broken: it computes iters as
+    epochs*len(dataset) but then calls dataset.select(range(iters)), which
+    IndexErrors instead of cycling. So we have to materialize the multi-
+    epoch view ourselves and pass --iters to the trainer.
 
     Sweeps any stale jsonl files first — load_dataset auto-merges every
     json/jsonl in the directory, so a leftover file with a different
@@ -34,16 +41,20 @@ def write_mlx_dataset(in_path: Path, out_dir: Path) -> int:
     with open(in_path) as f:
         examples = [json.loads(line) for line in f]
 
+    rng = random.Random(42)
     out_path = out_dir / "train.jsonl"
     with open(out_path, "w") as f:
-        for ex in examples:
-            f.write(json.dumps({
-                "image": str(Path(ex["image"]).resolve()),
-                "question": ex["instruction"],
-                "answer": ex["action"],
-            }) + "\n")
+        for _ in range(epochs):
+            shuffled = examples[:]
+            rng.shuffle(shuffled)
+            for ex in shuffled:
+                f.write(json.dumps({
+                    "image": str(Path(ex["image"]).resolve()),
+                    "question": ex["instruction"],
+                    "answer": ex["action"],
+                }) + "\n")
 
-    return len(examples)
+    return len(examples) * epochs
 
 
 def main():
@@ -64,8 +75,8 @@ def main():
 
     mlx_data_dir = Path("data/mlx")
     print("📦 Formatting data for mlx_vlm.lora...")
-    n = write_mlx_dataset(data_path, mlx_data_dir)
-    print(f"   {n} examples → {mlx_data_dir}/train.jsonl")
+    total_rows = write_mlx_dataset(data_path, mlx_data_dir, epochs=args.epochs)
+    print(f"   {total_rows} rows ({total_rows // args.epochs} unique × {args.epochs} epochs) → {mlx_data_dir}/train.jsonl")
 
     # mlx_vlm.lora's --output-path is the full path of the adapter weights
     # *file*, not a directory. The adapter_config.json gets written next to
@@ -75,13 +86,18 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     adapter_file = out_dir / "adapters.safetensors"
 
+    # NOTE: passing --iters explicitly instead of --epochs. mlx-vlm 0.4.4's
+    # --epochs flag tries dataset.select(range(epochs*N)), which IndexErrors
+    # whenever epochs > 1. We pre-duplicated the data above, so iters is
+    # exactly the number of rows in the materialized dataset.
+    iters = total_rows // args.batch_size
     cmd = [
         sys.executable, "-m", "mlx_vlm.lora",
         "--model-path", args.model,
         "--dataset", str(mlx_data_dir.resolve()),
         "--split", "train",
         "--output-path", str(adapter_file.resolve()),
-        "--epochs", str(args.epochs),
+        "--iters", str(iters),
         "--batch-size", str(args.batch_size),
         "--learning-rate", str(args.lr),
         "--lora-rank", str(args.lora_rank),
@@ -89,7 +105,7 @@ def main():
     ]
 
     print(f"\n🚀 Training {args.model}")
-    print(f"   Epochs: {args.epochs}  LR: {args.lr}  LoRA rank: {args.lora_rank}")
+    print(f"   Iters: {iters}  Epochs: {args.epochs}  LR: {args.lr}  LoRA rank: {args.lora_rank}")
     print(f"   {' '.join(cmd)}\n")
 
     result = subprocess.run(cmd)
