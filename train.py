@@ -1,211 +1,104 @@
 """
-Train TWO versions of the same model:
+LoRA fine-tune Qwen2-VL-2B on AGUVIS GUI actions via mlx-vlm.
 
-1. text_model  — learns to output 'click(x=0.41, y=0.178)' (baseline)
-2. token_model — learns to output 'C0803' (kernel)
+Reads data/train.jsonl produced by prepare_data.py, rewrites it into the
+column layout that mlx_vlm.lora expects (image / question / answer), then
+invokes `python -m mlx_vlm.lora` as a subprocess.
 
-Same base model, same data, different output format.
-The benchmark will show that token_model generates faster
-because it has fewer tokens to produce.
-
-Usage:
-    uv run train                              # trains both
-    uv run train -- --format token            # train kernel only
-    uv run train -- --format text             # train baseline only
-    uv run train -- --epochs 2 --lr 1e-4      # tweak hyperparams
+The fine-tuned model learns to map (screenshot, instruction) → action call
+directly. No reasoning, no monologue. That's the "reflex" thesis.
 """
 
-import json
 import argparse
+import json
+import subprocess
 import sys
-import os
 from pathlib import Path
 
 
-def train_mlx(data_path: str, output_dir: str, model_name: str,
-              epochs: int, lr: float, lora_rank: int):
-    """LoRA fine-tune using MLX (Apple Silicon)."""
-    import mlx.core as mx
-    from mlx_lm import load, generate
-    from mlx_lm.tuner import train as mlx_train
-    from mlx_lm.tuner.utils import build_schedule
-
-    print(f"  Loading {model_name}...")
-    model, tokenizer = load(model_name)
-
-    # Load our data
-    examples = []
-    with open(data_path) as f:
-        for line in f:
-            examples.append(json.loads(line))
-
-    # Format for mlx-lm: simple prompt/completion pairs
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    split = int(len(examples) * 0.9)
-    for name, subset in [("train", examples[:split]), ("valid", examples[split:])]:
-        fpath = out_path / f"{name}.jsonl"
-        with open(fpath, "w") as f:
-            for ex in subset:
-                # Simple format: instruction → output
-                prompt = f"Action: {ex['instruction']}\nOutput:"
-                completion = f" {ex['output']}"
-                f.write(json.dumps({"prompt": prompt, "completion": completion}) + "\n")
-
-    print(f"  Training: {split} examples, Validation: {len(examples) - split}")
-    print(f"  Epochs: {epochs}, LR: {lr}, LoRA rank: {lora_rank}")
-
-    # Train
-    mlx_train(
-        model=model,
-        tokenizer=tokenizer,
-        args=type('Args', (), {
-            'data': str(out_path),
-            'train': True,
-            'adapter_file': str(out_path / "adapters.npz"),
-            'iters': len(examples[:split]) * epochs,
-            'batch_size': 1,
-            'learning_rate': lr,
-            'lora_layers': 8,
-            'lora_rank': lora_rank,
-            'val_batches': 10,
-            'steps_per_report': 50,
-            'steps_per_eval': 200,
-            'save_every': 500,
-            'max_seq_length': 512,
-            'grad_checkpoint': False,
-            'seed': 42,
-        })(),
-    )
-
-    print(f"  ✅ Saved adapter to {out_path / 'adapters.npz'}")
+DEFAULT_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
 
 
-def train_hf(data_path: str, output_dir: str, model_name: str,
-             epochs: int, lr: float, lora_rank: int):
-    """LoRA fine-tune using HuggingFace/PEFT (CUDA or CPU)."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
-    from peft import LoraConfig, get_peft_model
-    from torch.utils.data import Dataset
+def write_mlx_dataset(in_path: Path, out_dir: Path) -> int:
+    """Translate our {image, instruction, action} jsonl into mlx_vlm.lora's
+    expected {image, question, answer} schema with absolute image paths.
 
-    print(f"  Loading {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    Sweeps any stale jsonl files first — load_dataset auto-merges every
+    json/jsonl in the directory, so a leftover file with a different
+    schema will fail the load with a CastError.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in out_dir.glob("*.jsonl"):
+        stale.unlink()
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
+    with open(in_path) as f:
+        examples = [json.loads(line) for line in f]
 
-    lora_config = LoraConfig(
-        r=lora_rank, lora_alpha=lora_rank * 2,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05, task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    out_path = out_dir / "train.jsonl"
+    with open(out_path, "w") as f:
+        for ex in examples:
+            f.write(json.dumps({
+                "image": str(Path(ex["image"]).resolve()),
+                "question": ex["instruction"],
+                "answer": ex["action"],
+            }) + "\n")
 
-    # Load data
-    examples = []
-    with open(data_path) as f:
-        for line in f:
-            examples.append(json.loads(line))
-
-    class ActionDataset(Dataset):
-        def __init__(self, examples, tokenizer, max_len=512):
-            self.data = []
-            for ex in examples:
-                text = f"Action: {ex['instruction']}\nOutput: {ex['output']}"
-                enc = tokenizer(text, truncation=True, max_length=max_len,
-                                padding="max_length", return_tensors="pt")
-                self.data.append({
-                    "input_ids": enc["input_ids"].squeeze(),
-                    "attention_mask": enc["attention_mask"].squeeze(),
-                    "labels": enc["input_ids"].squeeze(),
-                })
-        def __len__(self): return len(self.data)
-        def __getitem__(self, i): return self.data[i]
-
-    split = int(len(examples) * 0.9)
-    train_ds = ActionDataset(examples[:split], tokenizer)
-    val_ds = ActionDataset(examples[split:], tokenizer)
-
-    out_path = Path(output_dir)
-    training_args = TrainingArguments(
-        output_dir=str(out_path),
-        num_train_epochs=epochs,
-        per_device_train_batch_size=2,
-        learning_rate=lr,
-        logging_steps=50,
-        save_strategy="epoch",
-        eval_strategy="epoch",
-        fp16=torch.cuda.is_available(),
-    )
-
-    trainer = Trainer(
-        model=model, args=training_args,
-        train_dataset=train_ds, eval_dataset=val_ds,
-    )
-    trainer.train()
-    model.save_pretrained(str(out_path / "adapter"))
-    print(f"  ✅ Saved adapter to {out_path / 'adapter'}")
-
-
-def train_one(fmt: str, backend: str, model_name: str,
-              epochs: int, lr: float, lora_rank: int):
-    """Train one format (text or token)."""
-    data_path = f"data/train_{fmt}.jsonl"
-    output_dir = f"models/{fmt}_model"
-
-    if not os.path.exists(data_path):
-        print(f"❌ {data_path} not found. Run: uv run prepare-data")
-        sys.exit(1)
-
-    n_examples = sum(1 for _ in open(data_path))
-    print(f"\n{'='*50}")
-    print(f"  Training {fmt.upper()} model")
-    print(f"  Data: {data_path} ({n_examples} examples)")
-    print(f"  Output: {output_dir}")
-    print(f"{'='*50}\n")
-
-    if backend == "mlx":
-        train_mlx(data_path, output_dir, model_name, epochs, lr, lora_rank)
-    else:
-        train_hf(data_path, output_dir, model_name, epochs, lr, lora_rank)
+    return len(examples)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--format", choices=["text", "token", "both"], default="both")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct",
-                        help="Base LM (use a small one for fast training)")
+    parser.add_argument("--data", default="data/train.jsonl")
+    parser.add_argument("--output", default="models/reflex")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--lora-rank", type=int, default=8)
     args = parser.parse_args()
 
-    # Auto-detect backend
-    backend = "mlx"
-    try:
-        import mlx
-    except ImportError:
-        backend = "hf"
-    print(f"Backend: {backend}")
+    data_path = Path(args.data)
+    if not data_path.exists():
+        print(f"❌ {data_path} not found. Run: uv run prepare-data")
+        sys.exit(1)
 
-    if args.format in ("text", "both"):
-        train_one("text", backend, args.model, args.epochs, args.lr, args.lora_rank)
-    if args.format in ("token", "both"):
-        train_one("token", backend, args.model, args.epochs, args.lr, args.lora_rank)
+    mlx_data_dir = Path("data/mlx")
+    print("📦 Formatting data for mlx_vlm.lora...")
+    n = write_mlx_dataset(data_path, mlx_data_dir)
+    print(f"   {n} examples → {mlx_data_dir}/train.jsonl")
 
-    if args.format == "both":
-        print(f"\n{'='*50}")
-        print(f"  ✅ Both models trained!")
-        print(f"  Next: uv run benchmark")
-        print(f"{'='*50}")
+    # mlx_vlm.lora's --output-path is the full path of the adapter weights
+    # *file*, not a directory. The adapter_config.json gets written next to
+    # it. We use 'adapters.safetensors' because that's the exact filename
+    # mlx_vlm.utils.load → apply_lora_layers looks for at load time.
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    adapter_file = out_dir / "adapters.safetensors"
+
+    cmd = [
+        sys.executable, "-m", "mlx_vlm.lora",
+        "--model-path", args.model,
+        "--dataset", str(mlx_data_dir.resolve()),
+        "--split", "train",
+        "--output-path", str(adapter_file.resolve()),
+        "--epochs", str(args.epochs),
+        "--batch-size", str(args.batch_size),
+        "--learning-rate", str(args.lr),
+        "--lora-rank", str(args.lora_rank),
+        "--train-on-completions",
+    ]
+
+    print(f"\n🚀 Training {args.model}")
+    print(f"   Epochs: {args.epochs}  LR: {args.lr}  LoRA rank: {args.lora_rank}")
+    print(f"   {' '.join(cmd)}\n")
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"\n❌ mlx_vlm.lora exited with {result.returncode}")
+        sys.exit(result.returncode)
+
+    print(f"\n✅ Adapter saved to {out_dir}/")
+    print("   Next: uv run benchmark")
 
 
 if __name__ == "__main__":

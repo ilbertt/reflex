@@ -1,248 +1,204 @@
 """
-Benchmark: Text model vs Token model (kernel)
+Benchmark: Reflex (fine-tuned) vs CoT (prompted base) — same Qwen2-VL model.
 
-Feeds the same instructions to both models and measures:
-  - Time to generate the output (inference latency)
-  - Number of tokens generated
-  - Tokens per second
+Both modes get the same image + same instruction. The difference is what
+the model is asked to produce:
 
-The token model should be faster because it generates fewer tokens
-for the same action — 'C0803' (5 chars) vs 'click(x=0.41, y=0.178)' (23 chars).
+  REFLEX (fine-tuned):  emit the action call directly (~5–15 tokens)
+  COT    (base prompt): "think step by step, then output the action"
+                        (~80–200 tokens of monologue + the action)
 
-Usage:
-    uv run benchmark                           # run benchmark
-    uv run benchmark -- --n 100                # test on 100 examples
-    uv run benchmark -- --model Qwen/...       # specify base model
+We measure wall-clock latency and number of generated tokens. The thesis:
+fine-tuning collapses the reasoning into a reflex, so the same model gets
+dramatically faster on the same task.
 """
 
-import json
-import time
-import sys
-import os
 import argparse
+import json
+import os
+import sys
+import time
 from pathlib import Path
-from action_tokens import decode_action_sequence
 
 
-def load_model_mlx(model_name: str, adapter_path: str = None):
-    """Load model with MLX."""
-    from mlx_lm import load, generate
-    model, tokenizer = load(model_name, adapter_path=adapter_path)
-    return model, tokenizer, generate
+DEFAULT_MODEL = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+
+# Reflex prompt is just the instruction — that's what the model was tuned on.
+REFLEX_PROMPT = "{instruction}"
+
+# CoT prompt asks the unmodified base model to reason aloud first.
+COT_PROMPT = (
+    "You are a GUI agent. Look at the screenshot.\n\n"
+    "Task: {instruction}\n\n"
+    "First, think step by step about which on-screen element matches the task "
+    "and roughly where it sits. Then on a new line starting with 'Action:', "
+    "output exactly one action call (e.g. click(x=0.41, y=0.18))."
+)
 
 
-def load_model_hf(model_name: str, adapter_path: str = None):
-    """Load model with HuggingFace."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-    )
-    if adapter_path:
-        model = PeftModel.from_pretrained(model, adapter_path)
-    model.eval()
-
-    def generate_fn(model, tokenizer, prompt="", max_tokens=128, **kwargs):
-        inputs = tokenizer(prompt, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.cuda() for k, v in inputs.items()}
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=max_tokens,
-                                  do_sample=False, temperature=0.1)
-        return tokenizer.decode(out[0][inputs["input_ids"].shape[1]:],
-                                skip_special_tokens=True)
-
-    return model, tokenizer, generate_fn
+def load_test_examples(path: Path, n: int) -> list[dict]:
+    with open(path) as f:
+        examples = [json.loads(line) for line in f]
+    return examples[-n:]
 
 
-def run_inference(model, tokenizer, generate_fn, prompt: str,
-                  max_tokens: int = 128, backend: str = "mlx") -> tuple[str, float, int]:
-    """Run inference, return (output, time_seconds, n_tokens)."""
+def run_one(model, processor, config, image_path, prompt_text, max_tokens, generate, apply_chat_template):
+    """Run one inference and return the GenerationResult plus wall time.
+
+    The GenerationResult exposes prompt_tokens / prompt_tps (prefill) and
+    generation_tokens / generation_tps (decode) separately, so we can
+    measure them as independent quantities instead of conflating them
+    into a single wall-clock number.
+    """
+    formatted = apply_chat_template(processor, config, prompt_text, num_images=1)
     t0 = time.time()
-
-    if backend == "mlx":
-        output = generate_fn(model, tokenizer, prompt=prompt,
-                             max_tokens=max_tokens, temp=0.1)
-    else:
-        output = generate_fn(model, tokenizer, prompt=prompt,
-                             max_tokens=max_tokens)
-
-    elapsed = time.time() - t0
-    n_tokens = len(tokenizer.encode(output))
-
-    return output.strip(), elapsed, n_tokens
+    result = generate(
+        model, processor, formatted,
+        image=[image_path],
+        max_tokens=max_tokens,
+        temp=0.0,
+        verbose=False,
+    )
+    wall = time.time() - t0
+    return result, wall
 
 
-def benchmark(n_examples: int = 50, model_name: str = "Qwen/Qwen2.5-1.5B-Instruct"):
-    """Run the benchmark."""
-
-    # Check data exists
-    for fmt in ("text", "token"):
-        if not os.path.exists(f"data/train_{fmt}.jsonl"):
-            print(f"❌ data/train_{fmt}.jsonl not found. Run: uv run prepare-data")
-            sys.exit(1)
-
-    # Detect backend
-    backend = "mlx"
-    try:
-        import mlx
-    except ImportError:
-        backend = "hf"
-
-    # Load test examples (use last N from dataset — not seen during training if split was 90/10)
-    text_examples = []
-    with open("data/train_text.jsonl") as f:
-        for line in f:
-            text_examples.append(json.loads(line))
-    token_examples = []
-    with open("data/train_token.jsonl") as f:
-        for line in f:
-            token_examples.append(json.loads(line))
-
-    # Use the last N as test set
-    test_text = text_examples[-n_examples:]
-    test_token = token_examples[-n_examples:]
-
-    # Load both models
-    text_adapter = "models/text_model/adapters.npz" if backend == "mlx" else "models/text_model/adapter"
-    token_adapter = "models/token_model/adapters.npz" if backend == "mlx" else "models/token_model/adapter"
-
-    has_text_model = os.path.exists(text_adapter)
-    has_token_model = os.path.exists(token_adapter)
-
-    if not has_text_model and not has_token_model:
-        print("❌ No trained models found. Run: uv run train")
-        sys.exit(1)
-
-    loader = load_model_mlx if backend == "mlx" else load_model_hf
+def benchmark_mode(label, model_name, adapter_path, prompt_tpl, max_tokens, test, results):
+    from mlx_vlm import load, generate
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from mlx_vlm.utils import load_config
+    import mlx.core as mx
 
     print(f"\n{'='*60}")
-    print(f"  ⚡ ACTION KERNEL BENCHMARK")
-    print(f"  Base model: {model_name}")
-    print(f"  Backend: {backend}")
-    print(f"  Test examples: {n_examples}")
+    print(f"  {label}")
     print(f"{'='*60}")
+    print(f"  Loading {model_name}" + (f" + adapter {adapter_path}" if adapter_path else ""))
 
-    results = {}
+    if adapter_path:
+        model, processor = load(model_name, adapter_path=adapter_path)
+    else:
+        model, processor = load(model_name)
+    config = load_config(model_name)
 
-    for fmt, adapter, test_data, has_model in [
-        ("text", text_adapter, test_text, has_text_model),
-        ("token", token_adapter, test_token, has_token_model),
-    ]:
-        if not has_model:
-            print(f"\n  ⏭ Skipping {fmt} model (not trained)")
-            continue
+    prefill_ms, gen_ms, wall_ms = [], [], []
+    gen_tokens, prompt_tokens = [], []
+    outputs = []
 
-        label = "BASELINE (text)" if fmt == "text" else "KERNEL (tokens)"
-        print(f"\n{'─'*60}")
-        print(f"  Loading {label}...")
-        model, tokenizer, generate_fn = loader(model_name, adapter)
+    # Warmup
+    warm = test[0]
+    run_one(
+        model, processor, config, warm["image"],
+        prompt_tpl.format(instruction=warm["instruction"]),
+        max_tokens, generate, apply_chat_template,
+    )
 
-        times = []
-        token_counts = []
-        output_chars = []
+    for i, ex in enumerate(test):
+        prompt_text = prompt_tpl.format(instruction=ex["instruction"])
+        result, wall = run_one(
+            model, processor, config, ex["image"],
+            prompt_text, max_tokens, generate, apply_chat_template,
+        )
 
-        # Warmup
-        prompt = f"Action: {test_data[0]['instruction']}\nOutput:"
-        run_inference(model, tokenizer, generate_fn, prompt, backend=backend)
+        # Decompose latency into prefill and decode using mlx-vlm's reported tps.
+        # prompt_tps and generation_tps are tokens-per-second for each phase.
+        pf_ms = (result.prompt_tokens / result.prompt_tps * 1000) if result.prompt_tps else 0.0
+        gn_ms = (result.generation_tokens / result.generation_tps * 1000) if result.generation_tps else 0.0
 
-        print(f"  Running {n_examples} inferences...")
+        prefill_ms.append(pf_ms)
+        gen_ms.append(gn_ms)
+        wall_ms.append(wall * 1000)
+        gen_tokens.append(result.generation_tokens)
+        prompt_tokens.append(result.prompt_tokens)
+        outputs.append(result.text)
 
-        for i, ex in enumerate(test_data):
-            prompt = f"Action: {ex['instruction']}\nOutput:"
-            output, elapsed, n_tok = run_inference(
-                model, tokenizer, generate_fn, prompt, backend=backend
-            )
-            times.append(elapsed)
-            token_counts.append(n_tok)
-            output_chars.append(len(output))
+        if i < 3:
+            preview = result.text.replace("\n", " ")[:90]
+            print(f"  [{i+1}] prefill {pf_ms:.0f}ms + gen {gn_ms:.0f}ms ({result.generation_tokens} tok): {preview}")
+        elif i == 3:
+            print("  ...")
 
-            if i < 3:
-                print(f"    [{i+1}] {elapsed*1000:.0f}ms, {n_tok} tok: {output[:60]}...")
-            elif i == 3:
-                print(f"    ...")
+    def avg(xs): return sum(xs) / len(xs)
 
-        avg_time = sum(times) / len(times)
-        avg_tokens = sum(token_counts) / len(token_counts)
-        avg_chars = sum(output_chars) / len(output_chars)
-        p50 = sorted(times)[len(times) // 2]
-        p95 = sorted(times)[int(len(times) * 0.95)]
+    results[label] = {
+        "prefill_ms": avg(prefill_ms),
+        "generation_ms": avg(gen_ms),
+        "wall_ms": avg(wall_ms),
+        "prompt_tokens": avg(prompt_tokens),
+        "generation_tokens": avg(gen_tokens),
+        "gen_tps": avg(gen_tokens) / (avg(gen_ms) / 1000) if avg(gen_ms) > 0 else 0,
+    }
 
-        results[fmt] = {
-            "avg_time_ms": avg_time * 1000,
-            "p50_ms": p50 * 1000,
-            "p95_ms": p95 * 1000,
-            "avg_tokens": avg_tokens,
-            "avg_chars": avg_chars,
-            "tok_per_sec": avg_tokens / avg_time if avg_time > 0 else 0,
-        }
+    print(f"\n  Prefill:    {avg(prefill_ms):.0f}ms  ({avg(prompt_tokens):.0f} image+text tokens)")
+    print(f"  Generation: {avg(gen_ms):.0f}ms  ({avg(gen_tokens):.1f} tokens out)")
+    print(f"  Wall clock: {avg(wall_ms):.0f}ms")
 
-        print(f"\n  {label} results:")
-        print(f"    Avg latency:     {avg_time*1000:.0f}ms")
-        print(f"    P50 latency:     {p50*1000:.0f}ms")
-        print(f"    P95 latency:     {p95*1000:.0f}ms")
-        print(f"    Avg tokens out:  {avg_tokens:.1f}")
-        print(f"    Avg chars out:   {avg_chars:.0f}")
-        print(f"    Tokens/sec:      {avg_tokens/avg_time:.0f}")
-
-        # Cleanup to free memory before loading next model
-        del model
-        if backend == "mlx":
-            import mlx.core as mx
-            mx.metal.clear_cache()
-        else:
-            import torch
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-    # ── Comparison ──
-    if "text" in results and "token" in results:
-        t = results["text"]
-        k = results["token"]
-        speedup = t["avg_time_ms"] / k["avg_time_ms"] if k["avg_time_ms"] > 0 else 0
-        token_reduction = 1 - (k["avg_tokens"] / t["avg_tokens"]) if t["avg_tokens"] > 0 else 0
-
-        print(f"\n{'='*60}")
-        print(f"  📊 COMPARISON")
-        print(f"{'='*60}")
-        print(f"  {'':25} {'Text (baseline)':>18} {'Token (kernel)':>18}")
-        print(f"  {'─'*61}")
-        print(f"  {'Avg latency':25} {t['avg_time_ms']:>15.0f}ms {k['avg_time_ms']:>15.0f}ms")
-        print(f"  {'P50 latency':25} {t['p50_ms']:>15.0f}ms {k['p50_ms']:>15.0f}ms")
-        print(f"  {'P95 latency':25} {t['p95_ms']:>15.0f}ms {k['p95_ms']:>15.0f}ms")
-        print(f"  {'Avg output tokens':25} {t['avg_tokens']:>17.1f} {k['avg_tokens']:>17.1f}")
-        print(f"  {'Avg output chars':25} {t['avg_chars']:>17.0f} {k['avg_chars']:>17.0f}")
-        print(f"  {'Tokens/sec':25} {t['tok_per_sec']:>17.0f} {k['tok_per_sec']:>17.0f}")
-        print(f"  {'─'*61}")
-        print(f"  {'⚡ Latency speedup':25} {speedup:>35.1f}x")
-        print(f"  {'📉 Token reduction':25} {token_reduction:>34.0%}")
-        print(f"{'='*60}")
-        print()
-        print(f"  The kernel model generates {token_reduction:.0%} fewer tokens,")
-        print(f"  resulting in {speedup:.1f}x faster inference.")
-        print(f"  Same actions, less 'talking', more 'doing'.")
-        print()
-
-    # Save results
-    results_path = Path("results.json")
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"  Results saved to {results_path}")
+    del model, processor
+    mx.clear_cache()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n", type=int, default=50, help="Number of test examples")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--n", type=int, default=20, help="Test examples")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--adapter", default="models/reflex")
+    parser.add_argument("--data", default="data/train.jsonl")
+    parser.add_argument("--reflex-max-tokens", type=int, default=64)
+    parser.add_argument("--cot-max-tokens", type=int, default=256)
     args = parser.parse_args()
-    benchmark(n_examples=args.n, model_name=args.model)
+
+    data_path = Path(args.data)
+    if not data_path.exists():
+        print(f"❌ {data_path} not found. Run: uv run prepare-data")
+        sys.exit(1)
+
+    test = load_test_examples(data_path, args.n)
+    print(f"Test examples: {len(test)}")
+
+    has_adapter = os.path.exists(args.adapter)
+    if not has_adapter:
+        print(f"⚠️  No adapter at {args.adapter} — running CoT baseline only.")
+        print("   Run `uv run train` first to get the reflex model.")
+
+    results: dict = {}
+
+    if has_adapter:
+        benchmark_mode(
+            "REFLEX (fine-tuned)", args.model, args.adapter,
+            REFLEX_PROMPT, args.reflex_max_tokens, test, results,
+        )
+
+    benchmark_mode(
+        "COT (prompted base)", args.model, None,
+        COT_PROMPT, args.cot_max_tokens, test, results,
+    )
+
+    if "REFLEX (fine-tuned)" in results and "COT (prompted base)" in results:
+        r = results["REFLEX (fine-tuned)"]
+        c = results["COT (prompted base)"]
+
+        gen_speedup = c["generation_ms"] / r["generation_ms"] if r["generation_ms"] > 0 else 0
+        wall_speedup = c["wall_ms"] / r["wall_ms"] if r["wall_ms"] > 0 else 0
+        token_red = 1 - (r["generation_tokens"] / c["generation_tokens"]) if c["generation_tokens"] > 0 else 0
+
+        print(f"\n{'='*64}")
+        print("  📊 COMPARISON")
+        print(f"{'='*64}")
+        print(f"  {'':24}{'CoT base':>18}{'Reflex tuned':>18}")
+        print(f"  {'-'*62}")
+        print(f"  {'Prefill (image+text)':24}{c['prefill_ms']:>15.0f}ms{r['prefill_ms']:>15.0f}ms")
+        print(f"  {'Generation (decode)':24}{c['generation_ms']:>15.0f}ms{r['generation_ms']:>15.0f}ms")
+        print(f"  {'Wall clock total':24}{c['wall_ms']:>15.0f}ms{r['wall_ms']:>15.0f}ms")
+        print(f"  {'Output tokens':24}{c['generation_tokens']:>17.1f}{r['generation_tokens']:>17.1f}")
+        print(f"  {'-'*62}")
+        print(f"  ⚡ Generation speedup    {gen_speedup:>34.1f}x   ← thesis claim")
+        print(f"  ⏱  Wall-clock speedup    {wall_speedup:>34.1f}x   ← user-perceived")
+        print(f"  📉 Token reduction       {token_red:>33.0%}")
+        print(f"{'='*64}\n")
+        print(f"  Generation alone:  {gen_speedup:.1f}× faster (the part the thesis is about)")
+        print(f"  End-to-end:        {wall_speedup:.1f}× faster (image prefill is shared cost)\n")
+
+    Path("results.json").write_text(json.dumps(results, indent=2))
+    print("Results → results.json")
 
 
 if __name__ == "__main__":
