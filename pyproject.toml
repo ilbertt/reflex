@@ -1,7 +1,7 @@
 [project]
 name = "reflex"
 version = "0.1.0"
-description = "Action kernel MVP — token-based GUI action models"
+description = "Reflex — direct action heads vs autoregressive text for GUI agents"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
