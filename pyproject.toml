@@ -12,6 +12,7 @@ dependencies = [
 [project.scripts]
 train = "vm.train:main"
 demo = "vm.demo:main"
+security = "vm.security:main"
 
 [build-system]
 requires = ["setuptools>=68"]
