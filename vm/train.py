@@ -119,7 +119,7 @@ def collect_security_data(container: str, n_episodes: int = 100):
         if is_attack:
             subprocess.run(
                 ["docker", "exec", "-d", container, "sh", "-c",
-                 "exec 3</etc/passwd; cp /etc/passwd /tmp/.stolen; sleep 10"],
+                 "exec 3</etc/passwd; sleep 10; exec 3>&-"],
                 capture_output=True, timeout=2,
             )
             time.sleep(1)

@@ -68,7 +68,7 @@ def main():
             attack_active.set()
             subprocess.run(
                 ["docker", "exec", "-d", CONTAINER_NAME, "sh", "-c",
-                 "exec 3</etc/passwd; cp /etc/passwd /tmp/.stolen; sleep 10"],
+                 "exec 3</etc/passwd; sleep 10; exec 3>&-"],
                 capture_output=True, timeout=2,
             )
 
