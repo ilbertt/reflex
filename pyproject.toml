@@ -1,28 +1,22 @@
 [project]
 name = "reflex"
 version = "0.1.0"
-description = "Reflex — direct action heads vs autoregressive text for GUI agents"
+description = "Neural kernel: a model controls a Linux VM through continuous signals, not text"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "datasets>=4.8.4",
-    "huggingface-hub>=1.10.1",
     "mlx>=0.31.1",
-    "mlx-vlm>=0.4.4",
-    "pillow>=12.2.0",
-    "torch>=2.4",
-    "torchvision>=0.19",
-    "tqdm>=4.67.3",
+    "mlx-lm>=0.22.0",
+    "numpy>=2.0",
 ]
 
 [project.scripts]
-prepare-data = "prepare_data:main"
-train = "train:main"
-benchmark = "benchmark:main"
+train = "vm.train:main"
+demo = "vm.demo:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-py-modules = ["prepare_data", "train", "benchmark"]
+[tool.setuptools.packages.find]
+include = ["vm*"]

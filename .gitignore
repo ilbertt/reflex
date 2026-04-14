@@ -6,9 +6,11 @@ dist/
 wheels/
 *.egg-info
 
+.DS_Store
+
 # Virtual environments
 .venv
 
-data/
-models/
-results.json
+# Training artifacts (train locally with `uv run train`)
+*.npz
+*.pkl
