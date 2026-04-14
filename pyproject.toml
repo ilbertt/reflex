@@ -10,7 +10,8 @@ dependencies = [
 ]
 
 [project.scripts]
-reflex = "vm.raw_loop:main"
+train = "vm.train:main"
+demo = "vm.demo:main"
 
 [build-system]
 requires = ["setuptools>=68"]
