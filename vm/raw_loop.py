@@ -12,7 +12,6 @@ Usage:
     uv run python -m vm.raw_loop
 """
 
-import os
 import time
 import subprocess
 
@@ -20,7 +19,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten
 
 # ── Raw state: fixed-size byte windows from the machine ────────────────
 
