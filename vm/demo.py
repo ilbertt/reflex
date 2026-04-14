@@ -22,7 +22,7 @@ from .kernel import VM, STATE_DIM
 from .model import (
     ReflexHead, SYSCALL_TABLE, ARG_DIM,
     CONTEXT_LEN, load_backbone,
-    encode_instruction_last,
+    encode_instruction_last, instruction_to_bytes, decode_buffer,
     encode_prev_action, decode_syscall, set_arg_vocab, get_arg_vocab,
 )
 
@@ -95,6 +95,7 @@ def execute_instruction(instr, n_steps, head, backbone, tokenizer, vm, prev_sysc
     state_history = []
     instr_emb = encode_instruction_last(instr, backbone, tokenizer)
     mx.eval(instr_emb)
+    instr_bytes = instruction_to_bytes(instr)
 
     total_us = 0
 
@@ -109,16 +110,16 @@ def execute_instruction(instr, n_steps, head, backbone, tokenizer, vm, prev_sysc
         prev = encode_prev_action(prev_syscall_idx, prev_arg_values)
 
         t0 = time.perf_counter()
-        syscall_logits, arg_logits, buf_logits = head(
+        syscall_logits, arg_logits, gen_logits, copy_logits, gate = head(
             instr_emb, mx.array(window[None]), mx.array(prev[None]),
         )
-        mx.eval(syscall_logits, arg_logits, buf_logits)
+        mx.eval(syscall_logits, arg_logits, gen_logits, copy_logits, gate)
         us = (time.perf_counter() - t0) * 1e6
         total_us += us
 
         pred_idx = int(mx.argmax(syscall_logits[0]).item())
         arg_indices = np.array(mx.argmax(arg_logits[0], axis=1))
-        buf_bytes = np.array(mx.argmax(buf_logits[0], axis=1)).astype(np.uint8)
+        buf_bytes = decode_buffer(gen_logits[0], copy_logits[0], gate[0], instr_bytes)
         syscall_name = SYSCALL_TABLE[pred_idx]
 
         confidence = float(mx.softmax(syscall_logits[0])[pred_idx].item())

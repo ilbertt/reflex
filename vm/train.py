@@ -18,11 +18,10 @@ from mlx.utils import tree_flatten
 
 from .kernel import VM, SYS, BUF_OFFSET, O_CREAT, O_WRONLY, O_TRUNC, pack_syscall, STATE_DIM
 from .model import (
-    ReflexHead, SYSCALL_TABLE, ARG_DIM, BUF_MAX, BACKBONE_DIM,
-    CONTEXT_LEN, load_backbone,
-    encode_instruction_full, encode_instruction_last,
-    encode_syscall_target, encode_prev_action,
-    build_arg_vocab,
+    ReflexHead, SYSCALL_TABLE, ARG_DIM, BUF_MAX, INSTR_BYTES_MAX,
+    CONTEXT_LEN, load_backbone, encode_instruction_last,
+    encode_syscall_target, encode_prev_action, make_copy_targets,
+    instruction_to_bytes, build_arg_vocab,
 )
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -159,19 +158,22 @@ def collect(vm, backbone, tokenizer, n_rounds=10):
     for project in projects:
         for instr, _ in project:
             all_instrs.add(instr)
-
     instr_to_emb = {}
+    instr_to_bytes = {}
     for instr in all_instrs:
         emb = encode_instruction_last(instr, backbone, tokenizer)
         mx.eval(emb)
         instr_to_emb[instr] = np.array(emb[0])
+        instr_to_bytes[instr] = instruction_to_bytes(instr)
     print(f"  {len(all_instrs)} unique instructions encoded")
 
     windows, instr_embs, prev_actions = [], [], []
     nr_targets, arg_targets, buf_targets = [], [], []
+    copy_gates, copy_sources, instr_bytes_list = [], [], []
     descriptions = []
 
     def record_task(instr, syscalls, state_history, prev_syscall_idx, prev_arg_indices):
+        ib = instr_to_bytes[instr]
         for raw, desc in syscalls:
             state = vm.observe()
             window = np.zeros((CONTEXT_LEN, STATE_DIM), dtype=np.float32)
@@ -180,13 +182,17 @@ def collect(vm, backbone, tokenizer, n_rounds=10):
                 window[CONTEXT_LEN - len(hist[-CONTEXT_LEN:]) + i] = s
 
             syscall_idx, arg_indices, buf_target = encode_syscall_target(raw)
+            gate, source = make_copy_targets(buf_target, ib)
 
             windows.append(window)
             instr_embs.append(instr_to_emb[instr])
+            instr_bytes_list.append(ib)
             prev_actions.append(encode_prev_action(prev_syscall_idx, prev_arg_indices))
             nr_targets.append(syscall_idx)
             arg_targets.append(arg_indices)
             buf_targets.append(buf_target)
+            copy_gates.append(gate)
+            copy_sources.append(source)
             descriptions.append(desc)
 
             prev_syscall_idx = syscall_idx
@@ -215,45 +221,73 @@ def collect(vm, backbone, tokenizer, n_rounds=10):
         if (r + 1) % 5 == 0:
             print(f"  Round {r + 1}/{n_rounds} done ({len(nr_targets)} traces)")
 
-    W = np.stack(windows)
-    E = np.stack(instr_embs)
-    PA = np.stack(prev_actions)
-    NR = np.array(nr_targets, dtype=np.int32)
-    AT = np.stack(arg_targets)
-    BT = np.stack(buf_targets)
-
-    return W, E, PA, NR, AT, BT, descriptions, vocab
+    return (np.stack(windows), np.stack(instr_embs), np.stack(prev_actions),
+            np.array(nr_targets, dtype=np.int32), np.stack(arg_targets),
+            np.stack(buf_targets), np.stack(copy_gates), np.stack(copy_sources),
+            np.stack(instr_bytes_list), descriptions, vocab)
 
 
 # ── Training ───────────────────────────────────────────────────────────────
 
-def train(W, E, PA, NR, AT, BT, n_arg_vocab, steps=10000, lr=1e-3):
+def train(W, E, PA, NR, AT, BT, CG, CS, IB, n_arg_vocab, steps=10000, lr=1e-3):
     head = ReflexHead(n_arg_vocab=n_arg_vocab)
     scheduler = optim.cosine_decay(lr, steps, end=lr * 0.01)
     optimizer = optim.Adam(learning_rate=scheduler)
 
     Wm, Em, PAm = mx.array(W), mx.array(E), mx.array(PA)
     NRm, ATm, BTm = mx.array(NR), mx.array(AT), mx.array(BT)
+    CGm, CSm = mx.array(CG), mx.array(CS)
+    IBm = mx.array(IB)
 
     n_samples = W.shape[0]
     batch_size = min(128, n_samples)
 
-    def loss_fn(head, em, wm, pam, nrm, atm, btm):
-        syscall_logits, arg_logits, buf_logits = head(em, wm, pam)
+    def loss_fn(head, em, wm, pam, nrm, atm, btm, cgm, csm, ibm):
+        syscall_logits, arg_logits, gen_logits, copy_logits, gate = head(em, wm, pam)
 
         cls_loss = nn.losses.cross_entropy(syscall_logits, nrm).mean()
-
         B, A, V = arg_logits.shape
         arg_loss = nn.losses.cross_entropy(
             arg_logits.reshape(B * A, V), atm.reshape(B * A)
         ).mean()
 
-        B2, L, C = buf_logits.shape
-        buf_loss = nn.losses.cross_entropy(
-            buf_logits.reshape(B2 * L, C), btm.reshape(B2 * L)
+        # Mixed buffer loss: merge generate + copy into unified byte distribution
+        # gen_logits: [B, BUF_MAX, 256]
+        # copy_logits: [B, BUF_MAX, INSTR_BYTES_MAX]
+        # gate: [B, BUF_MAX, 1]
+        #
+        # For each position, the probability of byte value v is:
+        #   p(v) = (1-g) * softmax(gen)[v] + g * sum_j(softmax(copy)[j] * (instr[j]==v))
+        #
+        # But that's expensive. Instead, train all three heads directly:
+        # 1. gen_logits should predict the right byte (always useful as fallback)
+        # 2. copy_logits should point to the right source (when copying)
+        # 3. gate should be 1 when copying, 0 when generating
+
+        # Generate loss: on ALL positions (good fallback even for copy positions)
+        B2, L, C = gen_logits.shape
+        gen_loss = nn.losses.cross_entropy(
+            gen_logits.reshape(B2 * L, C), btm.reshape(B2 * L)
         ).mean()
 
-        return cls_loss + arg_loss + buf_loss
+        # Copy loss: only on copy positions
+        B3, L2, S = copy_logits.shape
+        copy_loss_all = nn.losses.cross_entropy(
+            copy_logits.reshape(B3 * L2, S), csm.reshape(B3 * L2)
+        ).reshape(B3, L2)
+        copy_loss = (copy_loss_all * cgm).sum() / (cgm.sum() + 1e-8)
+
+        # Gate loss: balanced BCE
+        gate_pred = mx.sigmoid(gate[:, :, 0])
+        gate_bce = -(cgm * mx.log(gate_pred + 1e-8) +
+                     (1 - cgm) * mx.log(1 - gate_pred + 1e-8))
+        # Upweight copy positions to balance
+        n_copy = cgm.sum() + 1e-8
+        n_gen = (1 - cgm).sum() + 1e-8
+        gate_weight = mx.where(cgm > 0.5, n_gen / n_copy, 1.0)
+        gate_loss = (gate_bce * gate_weight).mean()
+
+        return cls_loss + arg_loss + gen_loss + copy_loss + gate_loss
 
     perfect_count = 0
 
@@ -261,7 +295,8 @@ def train(W, E, PA, NR, AT, BT, n_arg_vocab, steps=10000, lr=1e-3):
         idx = mx.array(np.random.choice(n_samples, batch_size, replace=False))
 
         loss, grads = nn.value_and_grad(head, loss_fn)(
-            head, Em[idx], Wm[idx], PAm[idx], NRm[idx], ATm[idx], BTm[idx],
+            head, Em[idx], Wm[idx], PAm[idx], NRm[idx], ATm[idx],
+            BTm[idx], CGm[idx], CSm[idx], IBm[idx],
         )
         optimizer.update(head, grads)
         mx.eval(head.parameters(), optimizer.state)
@@ -269,14 +304,33 @@ def train(W, E, PA, NR, AT, BT, n_arg_vocab, steps=10000, lr=1e-3):
         if step % 200 == 0 or step == steps - 1:
             eval_n = min(256, n_samples)
             sl = slice(0, eval_n)
-            logits, arg_logits, buf_logits = head(Em[sl], Wm[sl], PAm[sl])
+            s_log, a_log, g_log, c_log, gate = head(Em[sl], Wm[sl], PAm[sl])
 
-            acc = (mx.argmax(logits, axis=1) == NRm[sl]).mean().item()
-            arg_acc = (mx.argmax(arg_logits, axis=2) == ATm[sl]).mean().item()
-            buf_acc = (mx.argmax(buf_logits, axis=2) == BTm[sl]).mean().item()
+            acc = (mx.argmax(s_log, axis=1) == NRm[sl]).mean().item()
+            arg_acc = (mx.argmax(a_log, axis=2) == ATm[sl]).mean().item()
+
+            # Decode buffer using gate
+            gate_pred = (mx.sigmoid(gate[:, :, 0]) > 0.5)
+            gen_pred = mx.argmax(g_log, axis=2)
+            copy_pred_idx = mx.argmax(c_log, axis=2)
+
+            # Reconstruct bytes
+            ib_eval = mx.array(IB[:eval_n])  # [eval_n, INSTR_BYTES_MAX]
+            # For copy positions, look up the byte from instruction
+            copy_bytes = mx.take_along_axis(
+                ib_eval,
+                copy_pred_idx.astype(mx.int32),
+                axis=1,
+            )
+            buf_pred = mx.where(gate_pred, copy_bytes, gen_pred)
+            buf_acc = (buf_pred == BTm[sl]).mean().item()
+
+            # Gate accuracy
+            gate_acc = ((gate_pred == CGm[sl].astype(mx.bool_))).mean().item()
 
             print(f"  step {step:5d}  loss={loss.item():.4f}  "
-                  f"syscall={acc:.1%}  args={arg_acc:.1%}  buf={buf_acc:.1%}")
+                  f"syscall={acc:.1%}  args={arg_acc:.1%}  "
+                  f"buf={buf_acc:.1%}  gate={gate_acc:.1%}")
 
             if acc == 1.0 and arg_acc == 1.0 and buf_acc == 1.0:
                 perfect_count += 1
@@ -293,8 +347,8 @@ def train(W, E, PA, NR, AT, BT, n_arg_vocab, steps=10000, lr=1e-3):
 
 def main():
     print("Reflex — Training\n")
-    print("Frozen backbone: Qwen2.5-Coder-1.5B (full hidden states)")
-    print("Trainable: action head + buffer head (cross-attention to instruction)\n")
+    print("Frozen backbone: Qwen2.5-Coder-1.5B")
+    print("Trainable: action head + copy buffer mechanism\n")
 
     backbone, tokenizer = load_backbone()
 
@@ -303,13 +357,20 @@ def main():
 
     print("\nCollecting syscall traces...")
     t0 = time.time()
-    W, E, PA, NR, AT, BT, descs, vocab = collect(vm, backbone, tokenizer, n_rounds=30)
+    W, E, PA, NR, AT, BT, CG, CS, IB, descs, vocab = collect(
+        vm, backbone, tokenizer, n_rounds=30
+    )
     print(f"  {len(NR)} traces, {len(set(descs))} unique syscall patterns")
+    # Show copy stats
+    total_positions = CG.size
+    copy_positions = CG.sum()
+    print(f"  Copy mechanism: {int(copy_positions)}/{total_positions} positions marked as copy "
+          f"({copy_positions/total_positions*100:.1f}%)")
     print(f"  Collected in {time.time()-t0:.1f}s")
 
     print(f"\nTraining...")
     t0 = time.time()
-    head = train(W, E, PA, NR, AT, BT, n_arg_vocab=len(vocab), steps=10000)
+    head = train(W, E, PA, NR, AT, BT, CG, CS, IB, n_arg_vocab=len(vocab), steps=10000)
     print(f"  Trained in {time.time()-t0:.1f}s")
 
     weights_path = os.path.join(DIR, "head_weights.npz")
@@ -318,22 +379,29 @@ def main():
     with open(vocab_path, "w") as f:
         json.dump(vocab, f)
 
+    # Test predictions
     print(f"\nTest predictions (first 20):")
     sl = slice(0, 20)
-    logits, arg_logits, buf_logits = head(
+    s_log, a_log, g_log, c_log, gate = head(
         mx.array(E[sl]), mx.array(W[sl]), mx.array(PA[sl])
     )
-    pred_nr = mx.argmax(logits, axis=1).tolist()
-    pred_buf = np.array(mx.argmax(buf_logits, axis=2))
+    pred_nr = mx.argmax(s_log, axis=1).tolist()
+    gate_pred = (mx.sigmoid(gate[:, :, 0]) > 0.5)
+    gen_pred = mx.argmax(g_log, axis=2)
+    copy_pred_idx = mx.argmax(c_log, axis=2)
+    ib_eval = mx.array(IB[:20])
+    copy_bytes = mx.take_along_axis(ib_eval, copy_pred_idx.astype(mx.int32), axis=1)
+    buf_pred = np.array(mx.where(gate_pred, copy_bytes, gen_pred))
 
     for i in range(20):
         true_name = SYSCALL_TABLE[NR[i]]
         pred_name = SYSCALL_TABLE[pred_nr[i]]
         ok = "ok" if pred_nr[i] == NR[i] else "MISS"
-        pred_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in pred_buf[i, :24])
+        pred_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in buf_pred[i, :24])
         true_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in BT[i, :24])
+        n_copy = int(CG[i].sum())
         print(f"  [{ok:4s}] {true_name:10s}→{pred_name:10s}  "
-              f"true=\"{true_str}\"  pred=\"{pred_str}\"")
+              f"true=\"{true_str}\"  pred=\"{pred_str}\"  (copy:{n_copy})")
 
     vm.stop()
     print(f"\nSaved: {weights_path} ({os.path.getsize(weights_path)//1024} KB)")
