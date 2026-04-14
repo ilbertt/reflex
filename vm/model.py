@@ -127,10 +127,13 @@ def apply_action(container: str, pid_bucket: int, priority_bucket: int, pids: li
 
 
 def kill_process(container: str, pid: int):
-    subprocess.run(
-        ["docker", "exec", container, "kill", "-9", str(pid)],
-        capture_output=True, timeout=1,
-    )
+    try:
+        subprocess.run(
+            ["docker", "exec", container, "kill", "-9", str(pid)],
+            capture_output=True, timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def boot_container():
