@@ -173,12 +173,8 @@ def load_or_encode(tasks, backbone, tokenizer):
     return instr_cache
 
 
-def collect_traces(tasks, backbone, tokenizer):
+def collect_traces(tasks, instr_cache):
     chip = Chip8()
-
-    instr_cache = load_or_encode(tasks, backbone, tokenizer)
-    print(f"  {len(instr_cache)} unique instructions")
-
     states, hiddens, tids, high_targets, low_targets = [], [], [], [], []
 
     for instr, program in tasks:
@@ -221,9 +217,9 @@ def collect_traces(tasks, backbone, tokenizer):
 
 # ── Training ───────────────────────────────────────────────────────────
 
-def train(S, H, T, HT, LT, steps=60000):
-    model = ReflexModel()
-    scheduler = optim.cosine_decay(5e-4, steps, end=1e-6)
+def train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4, label=""):
+    """Core training loop. Returns model with updated weights."""
+    scheduler = optim.cosine_decay(lr, steps, end=1e-6)
     optimizer = optim.Adam(learning_rate=scheduler)
 
     Sm, Hm, Tm = mx.array(S), mx.array(H), mx.array(T)
@@ -248,14 +244,111 @@ def train(S, H, T, HT, LT, steps=60000):
             hi, lo = model(Hm, Sm, Tm)
             acc = min((mx.argmax(hi, axis=1) == HTm).mean().item(),
                       (mx.argmax(lo, axis=1) == LTm).mean().item())
-            print(f"  step {step:5d}  loss={loss_fn(model, Hm, Sm, Tm, HTm, LTm).item():.4f}  acc={acc:.1%}")
+            print(f"  {label}step {step:5d}  loss={loss_fn(model, Hm, Sm, Tm, HTm, LTm).item():.4f}  acc={acc:.1%}")
             if acc == 1.0:
                 perfect += 1
                 if perfect >= 2:
                     print(f"  Converged.")
-                    break
+                    return model
             else:
                 perfect = 0
+
+    return model
+
+
+def collect_dagger_traces(model, tasks, instr_cache):
+    """Run inference on tasks, collect (wrong_state, correct_opcode) pairs.
+
+    Even when the model predicts a wrong opcode, we know the correct one
+    from the program. By training on these "off-policy" states, the model
+    learns to recover from its own errors.
+    """
+    chip = Chip8()
+    states, hiddens, tids, high_targets, low_targets = [], [], [], [], []
+    n_off_policy = 0
+
+    for instr, program in tasks:
+        hidden, tid = instr_cache[instr]
+        opcodes = []
+        for i in range(0, len(program), 2):
+            opcodes.append((program[i] << 8) | program[i + 1])
+
+        chip.load_program(program)
+
+        for k, correct_opcode in enumerate(opcodes):
+            state = chip.get_state()
+
+            # Ask model what it would do
+            h_mx = mx.array(hidden[None])
+            s_mx = mx.array(state[None])
+            t_mx = mx.array(tid[None])
+            hi_l, lo_l = model(h_mx, s_mx, t_mx)
+            mx.eval(hi_l, lo_l)
+            predicted = (int(mx.argmax(hi_l[0]).item()) << 8) | int(mx.argmax(lo_l[0]).item())
+
+            if predicted != correct_opcode:
+                # Off-policy state: record it with the correct label
+                states.append(state)
+                hiddens.append(hidden)
+                tids.append(tid)
+                high_targets.append((correct_opcode >> 8) & 0xFF)
+                low_targets.append(correct_opcode & 0xFF)
+                n_off_policy += 1
+
+            # Execute the MODEL's opcode (not the correct one) to get off-policy states
+            if predicted != 0x0000:
+                chip.step(predicted)
+            else:
+                # Model stopped early — execute correct opcode to continue
+                chip.step(correct_opcode)
+
+        # STOP token after program
+        state = chip.get_state()
+        states.append(state)
+        hiddens.append(hidden)
+        tids.append(tid)
+        high_targets.append(0)
+        low_targets.append(0)
+
+    if not states:
+        return None
+
+    max_seq = max(h.shape[0] for h in hiddens)
+    H = np.zeros((len(hiddens), max_seq, BACKBONE_DIM), dtype=np.float32)
+    for i, h in enumerate(hiddens):
+        H[i, :h.shape[0], :] = h
+
+    print(f"  DAgger: {n_off_policy} off-policy states from {len(tasks)} tasks")
+    return (np.stack(states), H, np.stack(tids),
+            np.array(high_targets, dtype=np.int32),
+            np.array(low_targets, dtype=np.int32))
+
+
+def train(S, H, T, HT, LT, tasks, instr_cache, dagger_rounds=3):
+    model = ReflexModel()
+
+    # Phase 1: teacher-forced training
+    model = train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4)
+
+    # Phase 2: DAgger rounds
+    for rnd in range(dagger_rounds):
+        print(f"\n  DAgger round {rnd + 1}/{dagger_rounds}...")
+        dagger = collect_dagger_traces(model, tasks, instr_cache)
+        if dagger is None or len(dagger[0]) == 0:
+            print(f"  No off-policy states — model is perfect at inference!")
+            break
+
+        # Merge original + DAgger data
+        dS, dH, dT, dHT, dLT = dagger
+        mS = np.concatenate([S, dS])
+        mH = np.concatenate([H, dH])
+        mT = np.concatenate([T, dT])
+        mHT = np.concatenate([HT, dHT])
+        mLT = np.concatenate([LT, dLT])
+        print(f"  Training on {len(mS)} samples ({len(dS)} new)")
+
+        model = train_loop(model, mS, mH, mT, mHT, mLT,
+                           steps=20000, lr=2e-4, label=f"[D{rnd+1}] ")
 
     return model
 
@@ -279,13 +372,15 @@ def main():
 
     print(f"\n{D}Collecting traces...{N}")
     t0 = time.time()
-    S, H, T, HT, LT = collect_traces(tasks, backbone, tokenizer)
+    instr_cache = load_or_encode(tasks, backbone, tokenizer)
+    print(f"  {len(instr_cache)} unique instructions")
+    S, H, T, HT, LT = collect_traces(tasks, instr_cache)
     print(f"  {len(S)} trace steps")
     print(f"  Collected in {time.time()-t0:.1f}s")
 
-    print(f"\n{D}Training...{N}")
+    print(f"\n{D}Training (with DAgger)...{N}")
     t0 = time.time()
-    model = train(S, H, T, HT, LT, steps=60000)
+    model = train(S, H, T, HT, LT, tasks, instr_cache)
     print(f"  Trained in {time.time()-t0:.1f}s")
 
     # Validate with actual inference (no teacher forcing)
