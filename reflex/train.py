@@ -245,6 +245,9 @@ def train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4, label=""):
             acc = min((mx.argmax(hi, axis=1) == HTm).mean().item(),
                       (mx.argmax(lo, axis=1) == LTm).mean().item())
             print(f"  {label}step {step:5d}  loss={loss_fn(model, Hm, Sm, Tm, HTm, LTm).item():.4f}  acc={acc:.1%}")
+            if acc >= 0.9999:
+                mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
+                print(f"  Saved weights (acc={acc:.4%})")
             if acc == 1.0:
                 perfect += 1
                 if perfect >= 2:
