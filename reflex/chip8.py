@@ -57,9 +57,8 @@ class Chip8:
                 self.memory[PROGRAM_START + i] = b
 
     def get_state(self) -> np.ndarray:
-        """Raw machine state: display + registers + memory around PC + prev opcode."""
-        PC_WINDOW = 32
-        dim = DISPLAY_SIZE + 16 + 2 + PC_WINDOW + 2
+        """Machine state: display + registers + prev opcode. No memory window."""
+        dim = DISPLAY_SIZE + 16 + 2 + 2  # 2068
         state = np.zeros(dim, dtype=np.float32)
         offset = 0
 
@@ -72,12 +71,6 @@ class Chip8:
         state[offset] = (self.I & 0xFF) / 255.0
         state[offset + 1] = ((self.I >> 8) & 0xFF) / 255.0
         offset += 2
-
-        for i in range(PC_WINDOW):
-            addr = self.pc + i
-            if 0 <= addr < MEMORY_SIZE:
-                state[offset + i] = self.memory[addr] / 255.0
-        offset += PC_WINDOW
 
         state[offset] = ((self.prev_opcode >> 8) & 0xFF) / 255.0
         state[offset + 1] = (self.prev_opcode & 0xFF) / 255.0

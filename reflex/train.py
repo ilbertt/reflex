@@ -179,6 +179,14 @@ def collect_traces(tasks, backbone, tokenizer):
 
             chip.step((hi << 8) | lo)
 
+        # After last opcode: teach the model to emit STOP (0x0000)
+        state = chip.get_state()
+        states.append(state)
+        hiddens.append(hidden)
+        tids.append(tid)
+        high_targets.append(0)
+        low_targets.append(0)
+
     # Pad hiddens
     max_seq = max(h.shape[0] for h in hiddens)
     H = np.zeros((len(hiddens), max_seq, BACKBONE_DIM), dtype=np.float32)

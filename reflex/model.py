@@ -19,9 +19,8 @@ from .chip8 import DISPLAY_SIZE
 BACKBONE_DIM = 1536
 BACKBONE_ID = "mlx-community/Qwen2.5-Coder-1.5B-Instruct-bf16"
 
-PC_WINDOW = 32
-STATE_DIM = DISPLAY_SIZE + 16 + 2 + PC_WINDOW + 2  # 2100
-STATE_TOKENS = 32  # project state into this many K/V tokens
+STATE_DIM = DISPLAY_SIZE + 16 + 2 + 2  # 2068 (display + registers + I + prev_opcode)
+STATE_TOKENS = 32
 MAX_TOKENS = 20    # pad/truncate instruction token IDs
 
 N_HIGH = 256
