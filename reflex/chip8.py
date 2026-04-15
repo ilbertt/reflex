@@ -127,7 +127,7 @@ class Chip8:
             self.V[x] = nn
         elif op == 0x7:
             # Add NN to Vx
-            self.V[x] = (self.V[x] + nn) & 0xFF
+            self.V[x] = (int(self.V[x]) + nn) & 0xFF
         elif op == 0x8:
             if n == 0x0:
                 self.V[x] = self.V[y]

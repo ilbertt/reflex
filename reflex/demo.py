@@ -114,9 +114,13 @@ def main():
     chip = Chip8()
 
     if interactive:
-        print(f"\n{D}Type any instruction. The model generates opcodes from understanding.{N}")
-        print(f"{D}Try: draw a smiley, draw a snake, draw digit 7 at position 15 10{N}")
-        print(f"{D}Type 'quit' to exit.{N}\n")
+        print(f"\n{D}Type an instruction. The model generates opcodes from understanding alone.{N}")
+        print(f"{D}Try:{N}")
+        print(f"{D}  draw a smiley              draw a circle{N}")
+        print(f"{D}  draw digit 7 at position 15 10{N}")
+        print(f"{D}  draw digit A at position 30 5{N}")
+        print(f"{D}  draw digit 0 at position 10 20{N}")
+        print(f"{D}Digits 0-F, positions 5-50 x 5-25. Type 'quit' to exit.{N}\n")
 
         while True:
             try:
@@ -130,10 +134,9 @@ def main():
     else:
         for instruction in [
             "draw a smiley",
-            "draw a snake",
             "draw digit 7 at position 15 10",
-            "draw a heart",
-            "draw a star",
+            "draw a circle",
+            "draw digit 5 at position 30 15",
         ]:
             run_instruction(chip, model, backbone, tokenizer, instruction)
 

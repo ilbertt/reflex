@@ -259,12 +259,10 @@ def train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4, label=""):
     return model
 
 
-def collect_dagger_traces(model, tasks, instr_cache):
-    """Run inference on tasks, collect (wrong_state, correct_opcode) pairs.
-
-    Even when the model predicts a wrong opcode, we know the correct one
-    from the program. By training on these "off-policy" states, the model
-    learns to recover from its own errors.
+def collect_dagger_traces(model, tasks, instr_cache, mix_rate=0.5):
+    """Mixed-rollout DAgger: at each step, follow model's prediction with
+    probability mix_rate, otherwise follow correct opcode. This keeps states
+    close to training data while exposing the model to mild perturbations.
     """
     chip = Chip8()
     states, hiddens, tids, high_targets, low_targets = [], [], [], [], []
@@ -281,7 +279,6 @@ def collect_dagger_traces(model, tasks, instr_cache):
         for k, correct_opcode in enumerate(opcodes):
             state = chip.get_state()
 
-            # Ask model what it would do
             h_mx = mx.array(hidden[None])
             s_mx = mx.array(state[None])
             t_mx = mx.array(tid[None])
@@ -290,7 +287,6 @@ def collect_dagger_traces(model, tasks, instr_cache):
             predicted = (int(mx.argmax(hi_l[0]).item()) << 8) | int(mx.argmax(lo_l[0]).item())
 
             if predicted != correct_opcode:
-                # Off-policy state: record it with the correct label
                 states.append(state)
                 hiddens.append(hidden)
                 tids.append(tid)
@@ -298,14 +294,13 @@ def collect_dagger_traces(model, tasks, instr_cache):
                 low_targets.append(correct_opcode & 0xFF)
                 n_off_policy += 1
 
-            # Execute the MODEL's opcode (not the correct one) to get off-policy states
-            if predicted != 0x0000:
+            # Mixed rollout: sometimes follow model, sometimes follow ground truth
+            if predicted != 0x0000 and np.random.random() < mix_rate:
                 chip.step(predicted)
             else:
-                # Model stopped early — execute correct opcode to continue
                 chip.step(correct_opcode)
 
-        # STOP token after program
+        # STOP token
         state = chip.get_state()
         states.append(state)
         hiddens.append(hidden)
@@ -333,10 +328,12 @@ def train(S, H, T, HT, LT, tasks, instr_cache, dagger_rounds=3):
     # Phase 1: teacher-forced training
     model = train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4)
 
-    # Phase 2: DAgger rounds
+    # Phase 2: DAgger rounds — ramp mix_rate from gentle to aggressive
+    mix_rates = [0.3, 0.5, 0.7]
     for rnd in range(dagger_rounds):
-        print(f"\n  DAgger round {rnd + 1}/{dagger_rounds}...")
-        dagger = collect_dagger_traces(model, tasks, instr_cache)
+        mix = mix_rates[rnd] if rnd < len(mix_rates) else 0.7
+        print(f"\n  DAgger round {rnd + 1}/{dagger_rounds} (mix_rate={mix})...")
+        dagger = collect_dagger_traces(model, tasks, instr_cache, mix_rate=mix)
         if dagger is None or len(dagger[0]) == 0:
             print(f"  No off-policy states — model is perfect at inference!")
             break
@@ -351,7 +348,7 @@ def train(S, H, T, HT, LT, tasks, instr_cache, dagger_rounds=3):
         print(f"  Training on {len(mS)} samples ({len(dS)} new)")
 
         model = train_loop(model, mS, mH, mT, mHT, mLT,
-                           steps=20000, lr=2e-4, label=f"[D{rnd+1}] ")
+                           steps=30000, lr=2e-4, label=f"[D{rnd+1}] ")
 
     return model
 
