@@ -14,7 +14,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from chip8 import DISPLAY_SIZE
+from .chip8 import DISPLAY_SIZE
 
 BACKBONE_DIM = 1536
 BACKBONE_ID = "mlx-community/Qwen2.5-Coder-1.5B-Instruct-bf16"

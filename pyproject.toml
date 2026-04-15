@@ -1,7 +1,7 @@
 [project]
 name = "reflex"
 version = "0.0.1"
-description = "Reflex — direct action heads vs autoregressive text for GUI agents"
+description = "A frozen LLM wired to a machine through cross-attention — no text generated"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -11,12 +11,12 @@ dependencies = [
 ]
 
 [project.scripts]
-train = "train:main"
-demo = "demo:main"
+train = "reflex.train:main"
+demo = "reflex.demo:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-py-modules = ["chip8", "model", "train", "demo"]
+[tool.setuptools.packages.find]
+include = ["reflex*"]

@@ -218,12 +218,3 @@ class Chip8:
         self.pc += 2
         return display_changed
 
-    def render(self) -> str:
-        """Render display as text."""
-        lines = []
-        for row in range(DISPLAY_H):
-            line = ""
-            for col in range(DISPLAY_W):
-                line += "█" if self.display[row * DISPLAY_W + col] else " "
-            lines.append(line)
-        return "\n".join(lines)

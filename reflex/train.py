@@ -14,8 +14,8 @@ import mlx.optimizers as optim
 import numpy as np
 from mlx.utils import tree_flatten
 
-from chip8 import Chip8, PROGRAM_START
-from model import ReflexModel, BACKBONE_DIM, MAX_TOKENS, load_backbone, encode_instruction
+from .chip8 import Chip8, PROGRAM_START
+from .model import ReflexModel, BACKBONE_DIM, load_backbone, encode_instruction
 
 
 # ── Programs ───────────────────────────────────────────────────────────
