@@ -1,7 +1,7 @@
 [project]
 name = "reflex"
-version = "0.2.0"
-description = "Neural kernel: a model reads raw machine bytes and emits control signals, no text"
+version = "0.0.1"
+description = "Reflex — direct action heads vs autoregressive text for GUI agents"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -10,13 +10,12 @@ dependencies = [
 ]
 
 [project.scripts]
-train = "vm.train:main"
-demo = "vm.demo:main"
-security = "vm.security:main"
+train = "train:main"
+demo = "demo:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-include = ["vm*"]
+[tool.setuptools]
+py-modules = ["chip8", "model", "train", "demo"]
