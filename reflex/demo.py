@@ -1,9 +1,12 @@
 """
 DEMO: LLM understands the instruction, control head acts on the machine.
 
+In interactive mode, type any instruction. The LLM finds the closest
+matching task via embedding similarity — no rigid parser.
+
 Usage:
     uv run demo       # preset test cases
-    uv run demo -i    # interactive: type your own instructions
+    uv run demo -i    # interactive
 """
 
 import sys
@@ -14,7 +17,7 @@ import numpy as np
 
 from .chip8 import Chip8, PROGRAM_START
 from .model import ReflexModel, load_backbone, encode_instruction
-from .train import prog_draw_digit, prog_draw_two_digits, prog_add_and_draw
+from .train import generate_tasks
 
 B = "\033[1m"
 D = "\033[2m"
@@ -70,60 +73,10 @@ def run_goal(chip, model, backbone_hidden, token_ids, max_steps=20):
     return steps_taken
 
 
-def parse_instruction(instr: str):
-    """Try to parse instruction into a program. Returns (program, n_expected_steps) or None."""
-    instr = instr.strip().lower()
-
-    # "draw digit X at position Y Z"
-    if instr.startswith("draw digit ") and " at position " in instr:
-        parts = instr.split()
-        try:
-            digit = int(parts[2], 16)
-            x = int(parts[5])
-            y = int(parts[6])
-            return prog_draw_digit(digit, x, y)
-        except (ValueError, IndexError):
-            pass
-
-    # "draw digits X and Y"
-    if instr.startswith("draw digits ") and " and " in instr:
-        parts = instr.split()
-        try:
-            d1 = int(parts[2], 16)
-            d2 = int(parts[4], 16)
-            return prog_draw_two_digits(d1, d2)
-        except (ValueError, IndexError):
-            pass
-
-    # "compute X plus Y and draw result"
-    if instr.startswith("compute ") and " plus " in instr:
-        parts = instr.split()
-        try:
-            a = int(parts[1])
-            b = int(parts[3])
-            return prog_add_and_draw(a, b)
-        except (ValueError, IndexError):
-            pass
-
-    return None
-
-
-def run_preset(backbone, tokenizer, model, chip):
-    test_cases = [
-        ("draw digit 7 at position 15 10", prog_draw_digit(7, 15, 10)),
-        ("draw digit A at position 25 15", prog_draw_digit(0xA, 25, 15)),
-        ("draw digits 4 and 2", prog_draw_two_digits(4, 2)),
-        ("compute 3 plus 5 and draw result", prog_add_and_draw(3, 5)),
-    ]
-
-    for instruction, program in test_cases:
-        run_instruction(instruction, program, backbone, tokenizer, model, chip)
-
-
 def run_instruction(instruction, program, backbone, tokenizer, model, chip):
     print(f"\n{B}━━━ \"{instruction}\" ━━━{N}")
 
-    # Get goal by running normally
+    # Goal
     chip.load_program(program)
     for _ in range(len(program) // 2):
         if chip.pc < PROGRAM_START or chip.pc >= PROGRAM_START + len(program):
@@ -135,11 +88,11 @@ def run_instruction(instruction, program, backbone, tokenizer, model, chip):
     print(f"{D}Goal:{N}")
     print(render_display(goal))
 
-    # Encode instruction through backbone
+    # Encode
     hidden, tid = encode_instruction(instruction, backbone, tokenizer)
     mx.eval(hidden)
 
-    # Model controls the machine
+    # Model controls
     chip.load_program(program)
     print(f"\n{D}Model:{N}")
     steps = run_goal(chip, model, hidden, tid)
@@ -154,30 +107,32 @@ def run_instruction(instruction, program, backbone, tokenizer, model, chip):
         print(render_display(result))
 
 
-def run_interactive(backbone, tokenizer, model, chip):
-    print(f"\n{D}Type an instruction. Examples:{N}")
-    print(f"  {D}draw digit 7 at position 15 10{N}")
-    print(f"  {D}draw digit A at position 25 15{N}")
-    print(f"  {D}draw digits 4 and 2{N}")
-    print(f"  {D}compute 3 plus 5 and draw result{N}")
-    print(f"  {D}quit{N}\n")
+def build_task_index(tasks, backbone, tokenizer):
+    """Build an embedding index of all trained tasks for similarity matching."""
+    print(f"{D}Indexing {len(tasks)} tasks for similarity matching...{N}")
+    embeddings = []
+    for instr, _ in tasks:
+        h, _ = encode_instruction(instr, backbone, tokenizer)
+        mx.eval(h)
+        # Mean pool + normalize
+        emb = np.array(h[0].mean(axis=0))
+        emb = emb / (np.linalg.norm(emb) + 1e-8)
+        embeddings.append(emb)
+    return np.stack(embeddings)
 
-    while True:
-        try:
-            instr = input(f"{B}> {N}").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
 
-        if not instr or instr == "quit":
-            break
+def find_closest_task(query, tasks, task_embeddings, backbone, tokenizer, top_k=3):
+    """Find the closest trained task to the user's query via embedding similarity."""
+    h, tid = encode_instruction(query, backbone, tokenizer)
+    mx.eval(h)
+    q_emb = np.array(h[0].mean(axis=0))
+    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-8)
 
-        program = parse_instruction(instr)
-        if program is None:
-            print(f"  {R}Can't parse. Try: draw digit 7 at position 15 10{N}")
-            continue
+    sims = task_embeddings @ q_emb
+    best_idx = int(np.argmax(sims))
+    best_sim = float(sims[best_idx])
 
-        run_instruction(instr, program, backbone, tokenizer, model, chip)
-        print()
+    return best_idx, best_sim
 
 
 def main():
@@ -205,11 +160,46 @@ def main():
         return
 
     chip = Chip8()
+    tasks = generate_tasks()
 
     if interactive:
-        run_interactive(backbone, tokenizer, model, chip)
+        task_embs = build_task_index(tasks, backbone, tokenizer)
+
+        print(f"\n{D}Type anything. The LLM finds the closest matching task.{N}")
+        print(f"{D}Examples:{N}")
+        print(f"  {D}draw digit 7 at position 15 10{N}")
+        print(f"  {D}show me the number 3 somewhere on screen{N}")
+        print(f"  {D}what is 4 + 2{N}")
+        print(f"  {D}display the letter B{N}")
+        print(f"  {D}quit{N}\n")
+
+        while True:
+            try:
+                query = input(f"{B}> {N}").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if not query or query == "quit":
+                break
+
+            idx, sim = find_closest_task(query, tasks, task_embs, backbone, tokenizer)
+            matched_instr, matched_prog = tasks[idx]
+
+            print(f"  {D}Matched: \"{matched_instr}\" (similarity: {sim:.3f}){N}")
+
+            run_instruction(query, matched_prog, backbone, tokenizer, model, chip)
+            print()
+
     else:
-        run_preset(backbone, tokenizer, model, chip)
+        from .train import prog_draw_digit, prog_draw_two_digits, prog_add_and_draw
+        test_cases = [
+            ("draw digit 7 at position 15 10", prog_draw_digit(7, 15, 10)),
+            ("draw digit A at position 25 15", prog_draw_digit(0xA, 25, 15)),
+            ("draw digits 4 and 2", prog_draw_two_digits(4, 2)),
+            ("compute 3 plus 5 and draw result", prog_add_and_draw(3, 5)),
+        ]
+        for instruction, program in test_cases:
+            run_instruction(instruction, program, backbone, tokenizer, model, chip)
 
     print(f"\n{D}Done.{N}")
 
