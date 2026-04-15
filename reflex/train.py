@@ -135,27 +135,48 @@ def generate_tasks() -> list[tuple[str, bytes]]:
                 tasks.append((f"draw {name} at position {x} {y}",
                               prog_draw_sprite(name, sprite, x, y)))
 
-    # Alternative phrasings for sprites
+    # Alternative phrasings at default position
     for name, sprite in SPRITES.items():
-        tasks.append((f"draw a {name}", prog_draw_sprite(name, sprite, 20, 10)))
-        tasks.append((f"show me a {name}", prog_draw_sprite(name, sprite, 20, 10)))
-        tasks.append((f"display {name}", prog_draw_sprite(name, sprite, 20, 10)))
+        for phrasing in [f"draw a {name}", f"show me a {name}", f"display {name}",
+                         f"render a {name}", f"create a {name}", f"make a {name}"]:
+            tasks.append((phrasing, prog_draw_sprite(name, sprite, 20, 10)))
 
     return tasks
 
 
 # ── Data collection ────────────────────────────────────────────────────
 
-def collect_traces(tasks, backbone, tokenizer):
-    chip = Chip8()
+def load_or_encode(tasks, backbone, tokenizer):
+    """Cache backbone encodings to disk. Saves ~50s per run."""
+    import os
+    import hashlib
 
-    print("  Encoding instructions...")
+    # Hash task list to detect changes
+    task_hash = hashlib.md5(str(sorted(set(i for i, _ in tasks))).encode()).hexdigest()[:8]
+    cache_file = f"encoding_cache_{task_hash}.npz"
+
+    if os.path.exists(cache_file):
+        print(f"  Loading cached encodings from {cache_file}...")
+        data = np.load(cache_file, allow_pickle=True)
+        return dict(data["cache"].item())
+
+    print("  Encoding instructions through backbone...")
     instr_cache = {}
     for instr, _ in tasks:
         if instr not in instr_cache:
             h, tid = encode_instruction(instr, backbone, tokenizer)
             mx.eval(h)
             instr_cache[instr] = (np.array(h[0]), tid)
+
+    np.savez(cache_file, cache=instr_cache)
+    print(f"  Cached {len(instr_cache)} encodings to {cache_file}")
+    return instr_cache
+
+
+def collect_traces(tasks, backbone, tokenizer):
+    chip = Chip8()
+
+    instr_cache = load_or_encode(tasks, backbone, tokenizer)
     print(f"  {len(instr_cache)} unique instructions")
 
     states, hiddens, tids, high_targets, low_targets = [], [], [], [], []
@@ -200,15 +221,15 @@ def collect_traces(tasks, backbone, tokenizer):
 
 # ── Training ───────────────────────────────────────────────────────────
 
-def train(S, H, T, HT, LT, steps=40000):
+def train(S, H, T, HT, LT, steps=60000):
     model = ReflexModel()
-    scheduler = optim.cosine_decay(1e-3, steps, end=1e-5)
+    scheduler = optim.cosine_decay(5e-4, steps, end=1e-6)
     optimizer = optim.Adam(learning_rate=scheduler)
 
     Sm, Hm, Tm = mx.array(S), mx.array(H), mx.array(T)
     HTm, LTm = mx.array(HT), mx.array(LT)
     n = len(S)
-    batch_size = min(64, n)
+    batch_size = min(256, n)
     perfect = 0
 
     def loss_fn(model, h, s, t, ht, lt):
@@ -264,11 +285,39 @@ def main():
 
     print(f"\n{D}Training...{N}")
     t0 = time.time()
-    model = train(S, H, T, HT, LT, steps=40000)
+    model = train(S, H, T, HT, LT, steps=60000)
     print(f"  Trained in {time.time()-t0:.1f}s")
 
+    # Validate with actual inference (no teacher forcing)
+    print(f"\n{D}Validating inference...{N}")
+    test_instrs = [
+        "draw a smiley", "draw a snake", "draw a heart", "draw a star",
+        "draw digit 7 at position 15 10", "compute 3 plus 5 and draw result",
+    ]
+    chip = Chip8()
+    passed = 0
+    for instr in test_instrs:
+        chip.reset()
+        h, tid = encode_instruction(instr, backbone, tokenizer)
+        mx.eval(h)
+        for _ in range(20):
+            state = chip.get_state()
+            hi_l, lo_l = model(h, mx.array(state[None]), mx.array(tid[None]))
+            mx.eval(hi_l, lo_l)
+            opcode = (int(mx.argmax(hi_l[0]).item()) << 8) | int(mx.argmax(lo_l[0]).item())
+            if opcode == 0x0000:
+                break
+            chip.step(opcode)
+        pixels = int(chip.display.sum())
+        ok = "✓" if pixels > 0 else "✗"
+        if pixels > 0:
+            passed += 1
+        print(f"  {ok} {instr} ({pixels} pixels)")
+
+    print(f"\n  Inference: {passed}/{len(test_instrs)} pass")
+
     mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
-    print(f"\n  Saved: weights.npz")
+    print(f"  Saved: weights.npz")
     print(f"  Run: uv run demo")
 
 
