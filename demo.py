@@ -1,8 +1,5 @@
 """
-DEMO: a neural net controls a CHIP-8 from raw bytes.
-
-Given a goal display, the model reads raw machine state and emits
-opcodes to reach the goal. It's a neural CPU.
+DEMO: LLM understands the instruction, control head acts on the machine.
 
 Usage:
     uv run demo
@@ -14,7 +11,7 @@ import mlx.core as mx
 import numpy as np
 
 from chip8 import Chip8, DISPLAY_SIZE, PROGRAM_START
-from model import ReflexModel
+from model import ReflexModel, load_backbone, encode_instruction
 from train import prog_draw_digit, prog_draw_two_digits, prog_add_and_draw
 
 B = "\033[1m"
@@ -46,14 +43,14 @@ def render_display(display: np.ndarray, width: int = 64, indent: str = "  ") -> 
     return "\n".join(lines)
 
 
-def run_goal(chip, model, goal_display, max_steps=20):
+def run_goal(chip, model, backbone_hidden, token_ids, goal_display, max_steps=20):
     steps_taken = 0
     for step in range(max_steps):
         state = chip.get_state()
-        model_input = np.concatenate([state, goal_display])
 
         t0 = time.perf_counter()
-        hi_logits, lo_logits = model(mx.array(model_input[None]))
+        hi_logits, lo_logits = model(
+            backbone_hidden, mx.array(state[None]), mx.array(token_ids[None]))
         mx.eval(hi_logits, lo_logits)
         us = (time.perf_counter() - t0) * 1e6
 
@@ -78,36 +75,37 @@ def main():
     print(f"""
 {B}╔════════════════════════════════════════════════════════════════╗
 ║                                                                ║
-║  Reflex: a neural CPU for CHIP-8                               ║
+║  Reflex: the LLM understands, the control head acts            ║
 ║                                                                ║
-║  The model reads raw machine state + goal display.             ║
-║  It emits 2-byte opcodes to reach the goal.                    ║
-║  No instruction manual. It learned by watching.                ║
+║  Frozen Qwen2.5-Coder-1.5B encodes the instruction.           ║
+║  Flipped cross-attention: instruction queries machine state.   ║
+║  Zero tokens generated.                                        ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝{N}
 """)
 
-    print(f"{D}Loading model...{N}")
+    print(f"{D}Loading...{N}")
+    backbone, tokenizer = load_backbone()
     model = ReflexModel()
     try:
         model.load_weights(list(mx.load("weights.npz").items()))
     except FileNotFoundError:
-        print("No weights found. Run: uv run train")
+        print("No weights. Run: uv run train")
         return
 
     chip = Chip8()
 
     test_cases = [
-        ("Draw digit 7 at (15, 10)", prog_draw_digit(7, 15, 10)),
-        ("Draw digit A at (25, 15)", prog_draw_digit(0xA, 25, 15)),
-        ("Draw pair: 4 2", prog_draw_two_digits(4, 2)),
-        ("Compute 3 + 5, draw result", prog_add_and_draw(3, 5)),
+        ("draw digit 7 at position 15 10", prog_draw_digit(7, 15, 10)),
+        ("draw digit A at position 25 15", prog_draw_digit(0xA, 25, 15)),
+        ("draw digits 4 and 2", prog_draw_two_digits(4, 2)),
+        ("compute 3 plus 5 and draw result", prog_add_and_draw(3, 5)),
     ]
 
-    for title, program in test_cases:
-        print(f"\n{B}━━━ {title} ━━━{N}")
+    for instruction, program in test_cases:
+        print(f"\n{B}━━━ \"{instruction}\" ━━━{N}")
 
-        # Get goal
+        # Goal
         chip.load_program(program)
         for _ in range(len(program) // 2):
             if chip.pc < PROGRAM_START or chip.pc >= PROGRAM_START + len(program):
@@ -119,10 +117,14 @@ def main():
         print(f"{D}Goal:{N}")
         print(render_display(goal))
 
-        # Model controls the machine
+        # Encode instruction
+        hidden, tid = encode_instruction(instruction, backbone, tokenizer)
+        mx.eval(hidden)
+
+        # Model controls
         chip.load_program(program)
         print(f"\n{D}Model:{N}")
-        steps = run_goal(chip, model, goal)
+        steps = run_goal(chip, model, hidden, tid, goal)
 
         result = chip.get_display()
         match = np.array_equal(result.astype(np.float32), goal)
