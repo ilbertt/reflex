@@ -58,22 +58,89 @@ def prog_add_and_draw(a: int, b: int) -> bytes:
     return b"".join(struct.pack(">H", op) for op in ops)
 
 
+def prog_draw_sprite(name: str, sprite_bytes: list[int], x: int, y: int) -> bytes:
+    """Draw a custom sprite. Stores sprite data at 0x300, then draws it."""
+    height = len(sprite_bytes)
+    ops = [0x00E0]  # clear
+
+    # Store sprite bytes in memory at 0x300 using registers + Fx55
+    # Load each byte into V0..Vn, set I=0x300, store
+    for i, b in enumerate(sprite_bytes[:8]):  # max 8 rows (V0-V7)
+        ops.append(0x6000 | (i << 8) | (b & 0xFF))  # Vi = byte
+    ops.append(0xA300)  # I = 0x300
+    ops.append(0xF055 | ((min(height, 8) - 1) << 8))  # store V0..Vn at I
+
+    # Set draw position
+    ops.append(0x6000 | (8 << 8) | (x & 0xFF))   # V8 = x
+    ops.append(0x6000 | (9 << 8) | (y & 0xFF))   # V9 = y
+    ops.append(0xA300)  # I = 0x300
+
+    # Draw sprite: D89n where n = height
+    ops.append(0xD890 | (min(height, 8) & 0xF))
+
+    return b"".join(struct.pack(">H", op) for op in ops)
+
+
+# Named sprites (8 pixels wide, variable height)
+SPRITES = {
+    "horizontal line": [0xFF],
+    "vertical line": [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80],
+    "box": [0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF],
+    "cross": [0x18, 0x18, 0xFF, 0x18, 0x18, 0xFF, 0x18, 0x18],
+    "diamond": [0x10, 0x28, 0x44, 0x82, 0x44, 0x28, 0x10],
+    "arrow right": [0x10, 0x18, 0xFC, 0xFE, 0xFC, 0x18, 0x10],
+    "arrow down": [0x10, 0x10, 0x10, 0xFE, 0x7C, 0x38, 0x10],
+    "smiley": [0x3C, 0x42, 0xA5, 0x81, 0xA5, 0x99, 0x42, 0x3C],
+    "heart": [0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18],
+    "star": [0x10, 0x38, 0xFE, 0x38, 0x6C, 0x44],
+    "triangle": [0x10, 0x28, 0x28, 0x44, 0x44, 0x82, 0xFE],
+    "snake": [0x00, 0x7E, 0x02, 0x3E, 0x20, 0x3F, 0x01, 0x7F],
+    "zigzag": [0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x03],
+    "checkerboard": [0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55],
+    "circle": [0x3C, 0x42, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C],
+    "x shape": [0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81],
+    "inverted triangle": [0xFE, 0x82, 0x44, 0x44, 0x28, 0x28, 0x10],
+    "letter L": [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xFE],
+    "letter T": [0xFE, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10],
+    "letter H": [0x82, 0x82, 0x82, 0xFE, 0x82, 0x82, 0x82],
+}
+
+
 def generate_tasks() -> list[tuple[str, bytes]]:
     tasks = []
-    # More diverse digit positions for better operand coverage
+
+    # Digit drawing
     for digit in range(16):
         for x in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]:
             for y in [5, 10, 15, 20, 25]:
                 tasks.append((f"draw digit {digit:X} at position {x} {y}",
                               prog_draw_digit(digit, x, y)))
+
+    # Two digits
     for d1 in range(16):
         for d2 in range(16):
             tasks.append((f"draw digits {d1:X} and {d2:X}",
                           prog_draw_two_digits(d1, d2)))
+
+    # Arithmetic
     for a in range(10):
         for b in range(10):
             tasks.append((f"compute {a} plus {b} and draw result",
                           prog_add_and_draw(a, b)))
+
+    # Custom sprites at various positions
+    for name, sprite in SPRITES.items():
+        for x in [5, 15, 25, 35]:
+            for y in [3, 10, 18]:
+                tasks.append((f"draw {name} at position {x} {y}",
+                              prog_draw_sprite(name, sprite, x, y)))
+
+    # Alternative phrasings for sprites
+    for name, sprite in SPRITES.items():
+        tasks.append((f"draw a {name}", prog_draw_sprite(name, sprite, 20, 10)))
+        tasks.append((f"show me a {name}", prog_draw_sprite(name, sprite, 20, 10)))
+        tasks.append((f"display {name}", prog_draw_sprite(name, sprite, 20, 10)))
+
     return tasks
 
 

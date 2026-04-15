@@ -58,7 +58,7 @@ class ReflexModel(nn.Module):
 
     Output: (high_byte_logits, low_byte_logits) — next opcode
     """
-    def __init__(self, dim=256, n_heads=4):
+    def __init__(self, dim=512, n_heads=8):
         super().__init__()
         # Instruction tokens → queries
         self.instr_norm = nn.RMSNorm(BACKBONE_DIM)
