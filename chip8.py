@@ -57,7 +57,7 @@ class Chip8:
                 self.memory[PROGRAM_START + i] = b
 
     def get_state(self) -> np.ndarray:
-        """Compact machine state: display + registers + PC-local memory + prev opcode."""
+        """Raw machine state: display + registers + memory around PC + prev opcode."""
         PC_WINDOW = 32
         dim = DISPLAY_SIZE + 16 + 2 + PC_WINDOW + 2
         state = np.zeros(dim, dtype=np.float32)
