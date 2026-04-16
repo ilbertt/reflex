@@ -13,6 +13,8 @@ dependencies = [
 [project.scripts]
 train = "reflex.train:main"
 demo = "reflex.demo:main"
+train-gru = "reflex.train_gru:main"
+demo-gru = "reflex.demo_gru:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -48,6 +48,23 @@ def encode_instruction(text: str, backbone, tokenizer):
     return hidden.astype(mx.float32), tid
 
 
+class GRUCell(nn.Module):
+    """Gated Recurrent Unit — gives the control head autoregressive memory."""
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.Wz = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        self.Wr = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        self.Wh = nn.Linear(input_dim + hidden_dim, hidden_dim)
+
+    def __call__(self, x, h):
+        xh = mx.concatenate([x, h], axis=-1)
+        z = mx.sigmoid(self.Wz(xh))
+        r = mx.sigmoid(self.Wr(xh))
+        xrh = mx.concatenate([x, r * h], axis=-1)
+        return (1 - z) * h + z * mx.tanh(self.Wh(xrh))
+
+
 class ReflexModel(nn.Module):
     """
     Flipped cross-attention: instruction queries the machine state.
@@ -139,3 +156,116 @@ class ReflexModel(nn.Module):
         h = h + self.mlp(h)
 
         return self.high_head(h), self.low_head(h)
+
+
+# Dimensions for previous-opcode encoding in the autoregressive head
+PREV_OP_DIM = 128  # hi_embed + lo_embed concatenated
+PREV_HALF = PREV_OP_DIM // 2
+
+
+class ReflexModelGRU(nn.Module):
+    """
+    Autoregressive control head with GRU memory.
+
+    Same core as ReflexModel (flipped cross-attention + token-ID pathway),
+    but adds a GRU cell that carries hidden state across opcode predictions
+    within a program. The previous opcode is an explicit input to the GRU,
+    which is what enables scheduled-sampling training: the previous opcode
+    can be ground-truth (teacher forcing) or the model's own argmax
+    (closing the exposure-bias gap).
+
+    Input (per step t):
+      - backbone_hidden: [B, seq_len, BACKBONE_DIM] — same every step
+      - state: [B, STATE_DIM] — machine state at step t
+      - token_ids: [B, MAX_TOKENS] — same every step
+      - prev_hi, prev_lo: [B] int32 — previous opcode (0 at step 0)
+      - h_state: [B, dim] GRU hidden state (None at step 0)
+
+    Output: (high_byte_logits, low_byte_logits, new_h_state)
+    """
+    def __init__(self, dim=512, n_heads=8):
+        super().__init__()
+        self.dim = dim
+
+        # Instruction tokens → queries
+        self.instr_norm = nn.RMSNorm(BACKBONE_DIM)
+        self.instr_proj = nn.Linear(BACKBONE_DIM, dim)
+
+        # Token ID embeddings
+        self.tid_embed = nn.Embedding(TID_VOCAB, TID_DIM)
+        self.tid_proj = nn.Linear(MAX_TOKENS * TID_DIM, dim)
+
+        # Machine state → K/V tokens
+        self.state_proj = nn.Linear(STATE_DIM, STATE_TOKENS * dim)
+
+        # Cross-attention
+        self.cross_attn = nn.MultiHeadAttention(dim, n_heads)
+        self.cross_norm = nn.RMSNorm(dim)
+
+        # Self-attention
+        self.self_attn = nn.MultiHeadAttention(dim, n_heads)
+        self.self_norm = nn.RMSNorm(dim)
+
+        # Pool
+        self.out_norm = nn.RMSNorm(dim)
+
+        # Previous-opcode embeddings (one per byte)
+        self.hi_embed = nn.Embedding(N_HIGH, PREV_HALF)
+        self.lo_embed = nn.Embedding(N_LOW, PREV_HALF)
+
+        # GRU: input = [context (dim), prev_op_embed (PREV_OP_DIM)]
+        self.gru = GRUCell(dim + PREV_OP_DIM, dim)
+
+        # Token ID pathway (direct to output, same as stateless)
+        self.tid_out = nn.Sequential(
+            nn.Linear(MAX_TOKENS * TID_DIM, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+        )
+
+        # Output
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.high_head = nn.Linear(dim, N_HIGH)
+        self.low_head = nn.Linear(dim, N_LOW)
+
+    def __call__(self, backbone_hidden, state, token_ids,
+                 prev_hi=None, prev_lo=None, h_state=None):
+        B = state.shape[0]
+
+        # Cross-attention pathway (same as stateless)
+        q = self.instr_proj(self.instr_norm(backbone_hidden))
+        tid_embedded = self.tid_embed(token_ids).reshape(B, -1)
+        tid_feat = self.tid_proj(tid_embedded)[:, None, :]
+        q = q + tid_feat
+
+        kv = self.state_proj(state).reshape(B, STATE_TOKENS, -1)
+
+        h = self.cross_norm(q)
+        h = q + self.cross_attn(h, kv, kv)
+
+        r = self.self_norm(h)
+        h = h + self.self_attn(r, r, r)
+
+        ctx = self.out_norm(h).mean(axis=1)  # [B, dim]
+
+        # Encode previous opcode (zeros at step 0)
+        if prev_hi is None:
+            prev_hi = mx.zeros((B,), dtype=mx.int32)
+            prev_lo = mx.zeros((B,), dtype=mx.int32)
+        prev_embed = mx.concatenate(
+            [self.hi_embed(prev_hi), self.lo_embed(prev_lo)], axis=-1
+        )  # [B, PREV_OP_DIM]
+
+        # GRU step
+        if h_state is None:
+            h_state = mx.zeros((B, self.dim))
+        gru_input = mx.concatenate([ctx, prev_embed], axis=-1)
+        h_state = self.gru(gru_input, h_state)
+
+        # Output (h_state + mlp residual + tid pathway)
+        out = h_state + self.mlp(h_state) + self.tid_out(tid_embedded)
+        return self.high_head(out), self.low_head(out), h_state
