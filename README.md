@@ -3,19 +3,22 @@
 **A frozen LLM wired directly to a machine — no text generated.**
 
 A frozen Qwen2.5-Coder-1.5B encodes human instructions. A trained control head
-cross-attends to the machine state and emits raw CHIP-8 opcodes. The LLM never
-generates a token — it only understands.
+emits raw CHIP-8 opcodes — complete programs with loops, conditionals,
+subroutines, and calls. The LLM never generates a token — it only understands.
 
 ```
-Human: "draw a smiley"
+Human: "count from 1 to 9 and display each digit"
   ↓
 Frozen LLM backbone → hidden states (understanding)
   ↓
 Control head: cross-attention + GRU memory
   ↓
-Emits: 00E0 603C 6142 62A5 6381 64A5 6599 6642 673C A300 F755 6814 690A A300 D898
+Emits a complete program:
+  00E0  MOV V0,0x0A  MOV V1,0x0A  MOV V2,0x01
+  FONT V2  DRAW V0,V1,5  ADD V0,0x08  ADD V2,0x01
+  SKE V2,0x0A  JUMP 0x208  JUMP 0x216
   ↓
-A smiley face appears on screen
+The CHIP-8 emulator runs it. The digits 1..9 appear in a row.
 ```
 
 ## Run
@@ -75,24 +78,53 @@ exposure-bias gap so inference accuracy tracks teacher-forced accuracy.
 
 ## What it does
 
-- **Sprites**: smiley, heart, star, circle, box, cross, triangle, diamond,
-  letter T, letter H, arrows, zigzag, checkerboard, snake, and more.
-- **Digits 0–F** at any position: `draw digit 7 at position 15 10`.
-- **Two-digit display**: `draw digits A and B`.
-- **Arithmetic**: `3 + 5`, `compute 4 plus 6 and draw result`, `add 3 and 5`.
-- **Natural phrasings**: `smiley`, `show me a heart`, `add three and five`.
+The model emits **complete CHIP-8 programs** with real control flow — not
+linear opcode sequences. Each generated program is then loaded into the
+emulator and runs end-to-end. Categories covered:
+
+- **Loops**: `count from 1 to 9 and display each digit`,
+  `count down from 7 to 1`, `blink the screen 5 times`.
+- **Conditionals**: `set V0 to 5; if V0 equals 5 draw a 1 else draw a 0`.
+- **Arithmetic with display**: `add 7 and 8 and show the result` (uses
+  BCD via FX33 + FX65 to draw multi-digit results),
+  `compute 3 times 4 and show it` (multiplication via repeated addition).
+- **Subroutines**: `draw a star using a subroutine called twice` (real
+  2NNN call / 00EE return, sprite stored at 0x300 via FX55).
+- **Memory**: `store 42 at address 0x300 and load it into V0`.
+- **Timers**: `wait for 30 ticks then draw a 1` (real delay-timer
+  busy loop).
+- **Random**: `draw a random digit` (CXNN).
+
+Each category includes 2-3 structural variants (forward/backward loops,
+different register layouts, subroutine before vs after main body, etc.)
+so the model learns the *pattern*, not the exact byte sequence.
+
+## Two modes of cross-attention grounding
+
+This build runs in **program-synthesis mode**: the machine state at
+emission time is held at zeros — the program hasn't run yet, there is
+nothing to ground against. Cross-attention degenerates to a learned
+constant context; the model is doing pure instruction → code translation,
+leaning on the GRU + token-ID pathway.
+
+The grounding thesis (instruction queries reading live machine state)
+is the focus of the **interactive-execution mode** showcased earlier in
+the project (the Pong controller). This mode showcases something
+different: direct neural code generation without text.
 
 ## Limits
 
-- Generalization is **structural** (LLM maps to the closest known task shape)
-  but not **symbolic**. `two plus three` triggers the arithmetic template
-  but with wrong operands, because word-form numbers weren't in arithmetic
-  training data and the LLM's hidden states don't bridge "two" and "2" in
-  arithmetic context.
+- Generalization is **structural** (LLM maps to the closest known program
+  shape) but not **symbolic**. Word-form numbers like `two plus three`
+  trigger the arithmetic template but with wrong operands.
+- Random programs are not byte-deterministic at execution time; the
+  display will show a different digit per run, but the structure is
+  fixed.
 - Out-of-distribution inputs usually get completed into a plausible-looking
   program rather than cleanly rejected.
-- Training covers ~10k instruction variants. Arbitrary CHIP-8 programs
-  outside this distribution aren't supported.
+- Training covers ~8k instruction variants across the seven categories
+  above. Arbitrary CHIP-8 programs outside this distribution aren't
+  supported.
 
 ## Why this architecture
 

@@ -48,6 +48,7 @@ class Chip8:
         self.sp = 0
         self.stack = np.zeros(16, dtype=np.uint16)
         self.prev_opcode = 0
+        self.delay_timer = 0
 
     def load_program(self, data: bytes):
         self.reset()
@@ -79,6 +80,8 @@ class Chip8:
         """Execute one opcode. Returns True if display changed."""
         opcode = int(opcode)
         self.prev_opcode = opcode
+        if self.delay_timer > 0:
+            self.delay_timer -= 1
         display_changed = False
         op = (opcode >> 12) & 0xF
         x = (opcode >> 8) & 0xF
@@ -101,6 +104,10 @@ class Chip8:
             return display_changed
         elif op == 0x2:
             # Call subroutine at NNN
+            if self.sp >= len(self.stack):
+                # Stack overflow — treat as a runtime error halt.
+                self.pc = (self.pc - 2) & 0xFFF  # park here so caller sees a stable pc
+                return display_changed
             self.stack[self.sp] = self.pc
             self.sp += 1
             self.pc = nnn
@@ -180,11 +187,11 @@ class Chip8:
             display_changed = True
         elif op == 0xF:
             if nn == 0x07:
-                self.V[x] = 0  # no delay timer in this minimal impl
+                self.V[x] = self.delay_timer
             elif nn == 0x0A:
                 self.V[x] = 0  # no key wait
             elif nn == 0x15:
-                pass  # set delay timer (ignored)
+                self.delay_timer = int(self.V[x])
             elif nn == 0x18:
                 pass  # set sound timer (ignored)
             elif nn == 0x1E:
