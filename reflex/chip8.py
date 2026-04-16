@@ -48,7 +48,6 @@ class Chip8:
         self.sp = 0
         self.stack = np.zeros(16, dtype=np.uint16)
         self.prev_opcode = 0
-        self.halted = False
 
     def load_program(self, data: bytes):
         self.reset()
@@ -75,10 +74,6 @@ class Chip8:
         state[offset] = ((self.prev_opcode >> 8) & 0xFF) / 255.0
         state[offset + 1] = (self.prev_opcode & 0xFF) / 255.0
         return state
-
-    def get_display(self) -> np.ndarray:
-        """Display as flat array of 0/1 pixels."""
-        return self.display.astype(np.float32)
 
     def step(self, opcode: int) -> bool:
         """Execute one opcode. Returns True if display changed."""

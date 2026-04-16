@@ -1,9 +1,6 @@
 """
-DEMO: LLM understands, control head generates opcodes. No pre-loaded programs.
-
-The model reads the instruction through the frozen backbone, cross-attends
-to the machine state, and generates opcodes step by step. Every opcode
-comes from the model's understanding — nothing is pre-loaded in memory.
+Demo: type an instruction, the model emits CHIP-8 opcodes to execute it.
+No pre-loaded programs — every opcode comes from the model's understanding.
 
 Usage:
     uv run demo       # preset test cases
@@ -17,7 +14,7 @@ import mlx.core as mx
 import numpy as np
 
 from .chip8 import Chip8
-from .model import ReflexModel, load_backbone, encode_instruction
+from .model import ReflexModel, encode_instruction, load_backbone
 
 B = "\033[1m"
 D = "\033[2m"
@@ -49,7 +46,6 @@ def render_display(display: np.ndarray, width: int = 64, indent: str = "  ") -> 
 
 
 def run_instruction(chip, model, backbone, tokenizer, instruction, max_steps=20):
-    """Model generates opcodes from instruction alone. No pre-loaded program."""
     chip.reset()
 
     h, tid = encode_instruction(instruction, backbone, tokenizer)
@@ -58,12 +54,17 @@ def run_instruction(chip, model, backbone, tokenizer, instruction, max_steps=20)
     print(f"\n{B}━━━ \"{instruction}\" ━━━{N}\n")
 
     total_us = 0
+    h_state = None
+    prev_hi = prev_lo = None
     for step in range(max_steps):
         state = chip.get_state()
 
         t0 = time.perf_counter()
-        hi_l, lo_l = model(h, mx.array(state[None]), mx.array(tid[None]))
-        mx.eval(hi_l, lo_l)
+        hi_l, lo_l, h_state = model(
+            h, mx.array(state[None]), mx.array(tid[None]),
+            prev_hi, prev_lo, h_state,
+        )
+        mx.eval(hi_l, lo_l, h_state)
         us = (time.perf_counter() - t0) * 1e6
         total_us += us
 
@@ -77,8 +78,9 @@ def run_instruction(chip, model, backbone, tokenizer, instruction, max_steps=20)
 
         print(f"  {D}step {step:2d}{N}  opcode={Y}0x{opcode:04X}{N}  {D}({us:.0f}µs){N}")
         chip.step(opcode)
+        prev_hi = mx.array([hi], dtype=mx.int32)
+        prev_lo = mx.array([lo], dtype=mx.int32)
 
-    # Show result
     pixels = int(chip.display.sum())
     if pixels > 0:
         print(f"\n{G}Result ({pixels} pixels, {total_us/1000:.1f}ms total):{N}")
@@ -108,7 +110,7 @@ def main():
     try:
         model.load_weights(list(mx.load("weights.npz").items()))
     except FileNotFoundError:
-        print("No weights. Run: uv run train")
+        print("No weights.npz. Run: uv run train")
         return
 
     chip = Chip8()

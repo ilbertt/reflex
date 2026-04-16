@@ -1,11 +1,12 @@
 """
-Reflex model: LLM backbone + flipped cross-attention control head.
+Reflex model: frozen LLM backbone + autoregressive control head.
 
-Instruction tokens = Q (the instruction looks at the machine)
-Machine state = K/V (the machine is the knowledge base)
-
-The LLM understands the instruction. The control head cross-attends
-to the machine state to decide the next opcode.
+Flow:
+  instruction → frozen LLM → hidden states (understanding, same every step)
+  machine state at step t → K/V tokens
+  cross-attention: instruction queries machine state
+  GRU: carries hidden state across steps, takes previous opcode as input
+  two output heads: high byte, low byte (next opcode)
 """
 
 import logging
@@ -27,6 +28,10 @@ TID_DIM = 64       # embedding dimension per token
 
 N_HIGH = 256
 N_LOW = 256
+
+# Previous-opcode encoding in the GRU input
+PREV_OP_DIM = 128
+PREV_HALF = PREV_OP_DIM // 2
 
 
 def load_backbone():
@@ -67,118 +72,25 @@ class GRUCell(nn.Module):
 
 class ReflexModel(nn.Module):
     """
-    Flipped cross-attention: instruction queries the machine state.
+    Autoregressive control head with two pathways and GRU memory.
 
-    Two pathways merge before the output heads:
-      1. Cross-attention pathway (the core): LLM hidden states → queries,
-         machine state → keys/values. Handles program structure — "what kind
-         of opcode comes next given where we are."
-      2. Token ID pathway: raw token IDs → learned embeddings → MLP. Handles
-         operand precision — "which specific digit, which specific sprite."
-         Needed because mean-pooled LLM embeddings don't separate "draw digit 1"
-         from "draw digit 7" well enough (0.9943 cosine similarity).
-
-    Input:
-      - backbone_hidden: [B, seq_len, BACKBONE_DIM] — LLM hidden states
-      - state: [B, STATE_DIM] — raw machine state
-      - token_ids: [B, MAX_TOKENS] — integer token IDs
-
-    Output: (high_byte_logits, low_byte_logits)
-    """
-    def __init__(self, dim=512, n_heads=8):
-        super().__init__()
-
-        # Instruction tokens → queries
-        self.instr_norm = nn.RMSNorm(BACKBONE_DIM)
-        self.instr_proj = nn.Linear(BACKBONE_DIM, dim)
-
-        # Token IDs → learned embeddings (not normalized floats!)
-        self.tid_embed = nn.Embedding(TID_VOCAB, TID_DIM)
-        self.tid_proj = nn.Linear(MAX_TOKENS * TID_DIM, dim)
-
-        # Machine state → K/V tokens
-        self.state_proj = nn.Linear(STATE_DIM, STATE_TOKENS * dim)
-
-        # Cross-attention: instruction looks at machine
-        self.cross_attn = nn.MultiHeadAttention(dim, n_heads)
-        self.cross_norm = nn.RMSNorm(dim)
-
-        # Self-attention over instruction tokens
-        self.self_attn = nn.MultiHeadAttention(dim, n_heads)
-        self.self_norm = nn.RMSNorm(dim)
-
-        # Pool
-        self.out_norm = nn.RMSNorm(dim)
-
-        # Token ID pathway: direct to output
-        # Embeddings carry operand-level detail that mean-pooled LLM states can't
-        self.tid_out = nn.Sequential(
-            nn.Linear(MAX_TOKENS * TID_DIM, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim),
-        )
-
-        # Output
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.ReLU(),
-            nn.Linear(dim * 2, dim),
-        )
-        self.high_head = nn.Linear(dim, N_HIGH)
-        self.low_head = nn.Linear(dim, N_LOW)
-
-    def __call__(self, backbone_hidden, state, token_ids):
-        B = state.shape[0]
-
-        # Instruction tokens → queries
-        q = self.instr_proj(self.instr_norm(backbone_hidden))  # [B, seq_len, dim]
-
-        # Embed token IDs and add as query bias
-        tid_embedded = self.tid_embed(token_ids).reshape(B, -1)  # [B, MAX_TOKENS * TID_DIM]
-        tid_feat = self.tid_proj(tid_embedded)[:, None, :]  # [B, 1, dim]
-        q = q + tid_feat
-
-        # Machine state → K/V tokens
-        kv = self.state_proj(state).reshape(B, STATE_TOKENS, -1)  # [B, STATE_TOKENS, dim]
-
-        # Cross-attention: instruction looks at machine
-        h = self.cross_norm(q)
-        h = q + self.cross_attn(h, kv, kv)
-
-        # Self-attention
-        r = self.self_norm(h)
-        h = h + self.self_attn(r, r, r)
-
-        # Pool + merge token ID signal
-        h = self.out_norm(h).mean(axis=1)
-        tid_signal = self.tid_out(tid_embedded)  # [B, dim]
-        h = h + tid_signal
-        h = h + self.mlp(h)
-
-        return self.high_head(h), self.low_head(h)
-
-
-# Dimensions for previous-opcode encoding in the autoregressive head
-PREV_OP_DIM = 128  # hi_embed + lo_embed concatenated
-PREV_HALF = PREV_OP_DIM // 2
-
-
-class ReflexModelGRU(nn.Module):
-    """
-    Autoregressive control head with GRU memory.
-
-    Same core as ReflexModel (flipped cross-attention + token-ID pathway),
-    but adds a GRU cell that carries hidden state across opcode predictions
-    within a program. The previous opcode is an explicit input to the GRU,
-    which is what enables scheduled-sampling training: the previous opcode
-    can be ground-truth (teacher forcing) or the model's own argmax
-    (closing the exposure-bias gap).
+    Cross-attention pathway (the core): LLM hidden states → queries,
+      machine state → keys/values. Handles program structure — "what
+      kind of opcode comes next given where we are."
+    Token ID pathway: hash-embedded token IDs → learned MLP, fed directly
+      into the output. Carries operand-level detail (which specific digit,
+      which specific sprite name) that mean-pooled LLM states can't
+      distinguish.
+    GRU memory: carries hidden state across opcode predictions within a
+      program. Previous opcode is an explicit input, enabling scheduled-
+      sampling training (teacher-forced prev_opcode vs. model's own
+      argmax) which closes the exposure-bias gap at inference.
 
     Input (per step t):
       - backbone_hidden: [B, seq_len, BACKBONE_DIM] — same every step
       - state: [B, STATE_DIM] — machine state at step t
       - token_ids: [B, MAX_TOKENS] — same every step
-      - prev_hi, prev_lo: [B] int32 — previous opcode (0 at step 0)
+      - prev_hi, prev_lo: [B] int32 — previous opcode (None/zeros at step 0)
       - h_state: [B, dim] GRU hidden state (None at step 0)
 
     Output: (high_byte_logits, low_byte_logits, new_h_state)
@@ -216,7 +128,7 @@ class ReflexModelGRU(nn.Module):
         # GRU: input = [context (dim), prev_op_embed (PREV_OP_DIM)]
         self.gru = GRUCell(dim + PREV_OP_DIM, dim)
 
-        # Token ID pathway (direct to output, same as stateless)
+        # Token ID pathway: direct to output
         self.tid_out = nn.Sequential(
             nn.Linear(MAX_TOKENS * TID_DIM, dim),
             nn.ReLU(),
@@ -236,20 +148,24 @@ class ReflexModelGRU(nn.Module):
                  prev_hi=None, prev_lo=None, h_state=None):
         B = state.shape[0]
 
-        # Cross-attention pathway (same as stateless)
+        # Instruction tokens → queries (with token-ID bias)
         q = self.instr_proj(self.instr_norm(backbone_hidden))
         tid_embedded = self.tid_embed(token_ids).reshape(B, -1)
         tid_feat = self.tid_proj(tid_embedded)[:, None, :]
         q = q + tid_feat
 
+        # Machine state → K/V tokens
         kv = self.state_proj(state).reshape(B, STATE_TOKENS, -1)
 
+        # Cross-attention (instruction looks at machine)
         h = self.cross_norm(q)
         h = q + self.cross_attn(h, kv, kv)
 
+        # Self-attention
         r = self.self_norm(h)
         h = h + self.self_attn(r, r, r)
 
+        # Pool → context vector
         ctx = self.out_norm(h).mean(axis=1)  # [B, dim]
 
         # Encode previous opcode (zeros at step 0)
@@ -258,7 +174,7 @@ class ReflexModelGRU(nn.Module):
             prev_lo = mx.zeros((B,), dtype=mx.int32)
         prev_embed = mx.concatenate(
             [self.hi_embed(prev_hi), self.lo_embed(prev_lo)], axis=-1
-        )  # [B, PREV_OP_DIM]
+        )
 
         # GRU step
         if h_state is None:
@@ -266,6 +182,6 @@ class ReflexModelGRU(nn.Module):
         gru_input = mx.concatenate([ctx, prev_embed], axis=-1)
         h_state = self.gru(gru_input, h_state)
 
-        # Output (h_state + mlp residual + tid pathway)
+        # Output (h_state + residual MLP + token-ID pathway)
         out = h_state + self.mlp(h_state) + self.tid_out(tid_embedded)
         return self.high_head(out), self.low_head(out), h_state

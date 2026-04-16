@@ -1,12 +1,17 @@
 """
-Train: LLM backbone + flipped cross-attention → CHIP-8 opcodes.
+Train: frozen LLM backbone + autoregressive control head → CHIP-8 opcodes.
+
+Trained with scheduled sampling so pure-inference accuracy tracks
+teacher-forced accuracy (closes the exposure-bias gap).
 
 Usage:
     uv run train
 """
 
-import time
+import hashlib
+import os
 import struct
+import time
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,7 +20,14 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from .chip8 import Chip8, PROGRAM_START
-from .model import ReflexModel, BACKBONE_DIM, load_backbone, encode_instruction
+from .model import (
+    BACKBONE_DIM,
+    MAX_TOKENS,
+    STATE_DIM,
+    ReflexModel,
+    encode_instruction,
+    load_backbone,
+)
 
 
 # ── Programs ───────────────────────────────────────────────────────────
@@ -58,21 +70,18 @@ def prog_add_and_draw(a: int, b: int) -> bytes:
     return b"".join(struct.pack(">H", op) for op in ops)
 
 
-def prog_draw_sprite(name: str, sprite_bytes: list[int], x: int, y: int) -> bytes:
+def prog_draw_sprite(sprite_bytes: list[int], x: int, y: int) -> bytes:
     """Draw a custom sprite. Stores sprite data at 0x300, then draws it."""
     height = len(sprite_bytes)
-    ops = [0x00E0]  # clear
-
+    ops = [0x00E0]
     for i, b in enumerate(sprite_bytes[:8]):
         ops.append(0x6000 | (i << 8) | (b & 0xFF))
     ops.append(0xA300)
     ops.append(0xF055 | ((min(height, 8) - 1) << 8))
-
     ops.append(0x6000 | (8 << 8) | (x & 0xFF))
     ops.append(0x6000 | (9 << 8) | (y & 0xFF))
     ops.append(0xA300)
     ops.append(0xD890 | (min(height, 8) & 0xF))
-
     return b"".join(struct.pack(">H", op) for op in ops)
 
 
@@ -100,7 +109,6 @@ SPRITES = {
     "letter H": [0x82, 0x82, 0x82, 0xFE, 0x82, 0x82, 0x82],
 }
 
-# Digit names for natural phrasing
 DIGIT_NAMES = {
     0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
     5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
@@ -110,7 +118,6 @@ DIGIT_NAMES = {
 # ── Phrasing generation ──────────────────────────────────────────────
 
 def digit_phrasings(digit: int, x: int, y: int) -> list[str]:
-    """Generate many natural phrasings for digit drawing."""
     d = f"{digit:X}"
     phrases = [
         f"draw digit {d} at position {x} {y}",
@@ -120,7 +127,6 @@ def digit_phrasings(digit: int, x: int, y: int) -> list[str]:
         f"put digit {d} at {x} {y}",
         f"show digit {d} at position {x} {y}",
     ]
-    # Short phrasings (only at default-ish positions to avoid ambiguity)
     if x == 10 and y == 10:
         phrases += [
             f"draw digit {d}",
@@ -148,7 +154,6 @@ def digit_phrasings(digit: int, x: int, y: int) -> list[str]:
 
 
 def arithmetic_phrasings(a: int, b: int) -> list[str]:
-    """Generate natural phrasings for arithmetic."""
     return [
         f"compute {a} plus {b} and draw result",
         f"add {a} and {b}",
@@ -166,7 +171,6 @@ def arithmetic_phrasings(a: int, b: int) -> list[str]:
 
 
 def sprite_phrasings(name: str) -> list[str]:
-    """Generate natural phrasings for sprite drawing."""
     return [
         f"draw a {name}",
         f"draw {name}",
@@ -191,7 +195,6 @@ def sprite_phrasings(name: str) -> list[str]:
 
 
 def sprite_position_phrasings(name: str, x: int, y: int) -> list[str]:
-    """Phrasings for sprite at specific position."""
     return [
         f"draw {name} at position {x} {y}",
         f"draw a {name} at position {x} {y}",
@@ -203,7 +206,6 @@ def sprite_position_phrasings(name: str, x: int, y: int) -> list[str]:
 
 
 def two_digit_phrasings(d1: int, d2: int) -> list[str]:
-    """Phrasings for two-digit display."""
     a, b = f"{d1:X}", f"{d2:X}"
     return [
         f"draw digits {a} and {b}",
@@ -219,36 +221,31 @@ def two_digit_phrasings(d1: int, d2: int) -> list[str]:
 def generate_tasks() -> list[tuple[str, bytes]]:
     tasks = []
 
-    # Digit drawing with many phrasings
     for digit in range(16):
         for x in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]:
             for y in [5, 10, 15, 20, 25]:
                 for phrase in digit_phrasings(digit, x, y):
                     tasks.append((phrase, prog_draw_digit(digit, x, y)))
 
-    # Two digits
     for d1 in range(16):
         for d2 in range(16):
             for phrase in two_digit_phrasings(d1, d2):
                 tasks.append((phrase, prog_draw_two_digits(d1, d2)))
 
-    # Arithmetic with many phrasings
     for a in range(10):
         for b in range(10):
             for phrase in arithmetic_phrasings(a, b):
                 tasks.append((phrase, prog_add_and_draw(a, b)))
 
-    # Custom sprites at various positions
     for name, sprite in SPRITES.items():
         for x in [5, 15, 25, 35]:
             for y in [3, 10, 18]:
                 for phrase in sprite_position_phrasings(name, x, y):
-                    tasks.append((phrase, prog_draw_sprite(name, sprite, x, y)))
+                    tasks.append((phrase, prog_draw_sprite(sprite, x, y)))
 
-    # Sprites at default position with many phrasings
     for name, sprite in SPRITES.items():
         for phrase in sprite_phrasings(name):
-            tasks.append((phrase, prog_draw_sprite(name, sprite, 20, 10)))
+            tasks.append((phrase, prog_draw_sprite(sprite, 20, 10)))
 
     return tasks
 
@@ -256,10 +253,7 @@ def generate_tasks() -> list[tuple[str, bytes]]:
 # ── Data collection ────────────────────────────────────────────────────
 
 def load_or_encode(tasks, backbone, tokenizer):
-    """Cache backbone encodings to disk. Saves ~50s per run."""
-    import os
-    import hashlib
-
+    """Cache backbone encodings to disk — saves ~5 min per run."""
     task_hash = hashlib.md5(str(sorted(set(i for i, _ in tasks))).encode()).hexdigest()[:8]
     cache_file = f"encoding_cache_{task_hash}.npz"
 
@@ -270,12 +264,11 @@ def load_or_encode(tasks, backbone, tokenizer):
 
     print("  Encoding instructions through backbone...")
     instr_cache = {}
-    unique = set(i for i, _ in tasks)
-    for idx, instr in enumerate(sorted(unique)):
-        if instr not in instr_cache:
-            h, tid = encode_instruction(instr, backbone, tokenizer)
-            mx.eval(h)
-            instr_cache[instr] = (np.array(h[0]), tid)
+    unique = sorted(set(i for i, _ in tasks))
+    for idx, instr in enumerate(unique):
+        h, tid = encode_instruction(instr, backbone, tokenizer)
+        mx.eval(h)
+        instr_cache[instr] = (np.array(h[0]), tid)
         if (idx + 1) % 500 == 0:
             print(f"    {idx + 1}/{len(unique)} encoded...")
 
@@ -284,12 +277,14 @@ def load_or_encode(tasks, backbone, tokenizer):
     return instr_cache
 
 
-def collect_traces(tasks, instr_cache):
+def collect_sequences(tasks, instr_cache):
+    """Collect per-program sequences for autoregressive training."""
     chip = Chip8()
-    states, hiddens, tids, high_targets, low_targets = [], [], [], [], []
+    programs = []
 
     for instr, program in tasks:
         hidden, tid = instr_cache[instr]
+        states, hi_targets, lo_targets = [], [], []
 
         chip.load_program(program)
         for _ in range(len(program) // 2):
@@ -298,79 +293,144 @@ def collect_traces(tasks, instr_cache):
             state = chip.get_state()
             hi = int(chip.memory[chip.pc])
             lo = int(chip.memory[chip.pc + 1])
-
             states.append(state)
-            hiddens.append(hidden)
-            tids.append(tid)
-            high_targets.append(hi)
-            low_targets.append(lo)
-
+            hi_targets.append(hi)
+            lo_targets.append(lo)
             chip.step((hi << 8) | lo)
 
         # STOP token
-        state = chip.get_state()
-        states.append(state)
-        hiddens.append(hidden)
-        tids.append(tid)
-        high_targets.append(0)
-        low_targets.append(0)
+        states.append(chip.get_state())
+        hi_targets.append(0)
+        lo_targets.append(0)
 
-    # Pad hiddens
-    max_seq = max(h.shape[0] for h in hiddens)
-    H = np.zeros((len(hiddens), max_seq, BACKBONE_DIM), dtype=np.float32)
-    for i, h in enumerate(hiddens):
-        H[i, :h.shape[0], :] = h
+        programs.append((hidden, tid, states, hi_targets, lo_targets))
 
-    return (np.stack(states), H, np.stack(tids),
-            np.array(high_targets, dtype=np.int32),
-            np.array(low_targets, dtype=np.int32))
+    max_steps = max(len(s) for _, _, s, _, _ in programs)
+    max_seq = max(h.shape[0] for h, _, _, _, _ in programs)
+    n = len(programs)
+
+    H = np.zeros((n, max_seq, BACKBONE_DIM), dtype=np.float32)
+    T = np.zeros((n, MAX_TOKENS), dtype=np.int32)
+    S = np.zeros((n, max_steps, STATE_DIM), dtype=np.float32)
+    HT = np.zeros((n, max_steps), dtype=np.int32)
+    LT = np.zeros((n, max_steps), dtype=np.int32)
+    M = np.zeros((n, max_steps), dtype=np.float32)
+
+    for i, (hidden, tid, states, hi_targets, lo_targets) in enumerate(programs):
+        H[i, :hidden.shape[0], :] = hidden
+        T[i] = tid
+        for j in range(len(states)):
+            S[i, j] = states[j]
+            HT[i, j] = hi_targets[j]
+            LT[i, j] = lo_targets[j]
+            M[i, j] = 1.0
+
+    total = int(M.sum())
+    print(f"  {n} programs, {total} total steps, max {max_steps} steps/program")
+    return H, T, S, HT, LT, M, max_steps
 
 
 # ── Training ───────────────────────────────────────────────────────────
 
-def train(S, H, T, HT, LT, steps=60000):
+def linear_epsilon(step, total_steps, start=1.0, end=0.1):
+    """Linear decay for scheduled sampling probability."""
+    t = min(step / total_steps, 1.0)
+    return start + (end - start) * t
+
+
+def train(H, T, S, HT, LT, M, max_steps, steps=80000):
     model = ReflexModel()
-    scheduler = optim.cosine_decay(5e-4, steps, end=1e-6)
+    scheduler = optim.cosine_decay(3e-4, steps, end=1e-6)
     optimizer = optim.Adam(learning_rate=scheduler)
 
-    Sm, Hm, Tm = mx.array(S), mx.array(H), mx.array(T)
-    HTm, LTm = mx.array(HT), mx.array(LT)
-    n = len(S)
-    batch_size = min(256, n)
+    Hm = mx.array(H)
+    Tm = mx.array(T)
+    Sm = mx.array(S)
+    HTm = mx.array(HT)
+    LTm = mx.array(LT)
+    Mm = mx.array(M)
+    n = len(H)
+    batch_size = min(32, n)
     perfect = 0
 
-    def loss_fn(model, h, s, t, ht, lt):
-        hi, lo = model(h, s, t)
-        return (nn.losses.cross_entropy(hi, ht).mean() +
-                nn.losses.cross_entropy(lo, lt).mean())
+    def loss_fn(model, h, s, t, ht, lt, mask, epsilon):
+        B = s.shape[0]
+        h_state = mx.zeros((B, model.dim))
+        prev_hi = mx.zeros((B,), dtype=mx.int32)
+        prev_lo = mx.zeros((B,), dtype=mx.int32)
+        total_loss = mx.array(0.0)
+
+        for step_t in range(max_steps):
+            hi_logits, lo_logits, h_state = model(
+                h, s[:, step_t], t, prev_hi, prev_lo, h_state
+            )
+            loss_hi = nn.losses.cross_entropy(hi_logits, ht[:, step_t]) * mask[:, step_t]
+            loss_lo = nn.losses.cross_entropy(lo_logits, lt[:, step_t]) * mask[:, step_t]
+            total_loss = total_loss + (loss_hi + loss_lo).sum()
+
+            # Scheduled sampling: GT with prob ε, else model's own argmax (detached)
+            use_gt = mx.random.uniform(shape=(B,)) < epsilon
+            pred_hi = mx.argmax(mx.stop_gradient(hi_logits), axis=-1).astype(mx.int32)
+            pred_lo = mx.argmax(mx.stop_gradient(lo_logits), axis=-1).astype(mx.int32)
+            prev_hi = mx.where(use_gt, ht[:, step_t], pred_hi)
+            prev_lo = mx.where(use_gt, lt[:, step_t], pred_lo)
+
+        return total_loss / mask.sum()
+
+    def eval_accuracy(epsilon):
+        """Evaluate at given ε (1.0 = teacher forcing, 0.0 = pure inference)."""
+        chunk = 64
+        correct_hi = correct_lo = total = 0
+        for i in range(0, n, chunk):
+            h = Hm[i:i+chunk]
+            s = Sm[i:i+chunk]
+            t = Tm[i:i+chunk]
+            ht = HTm[i:i+chunk]
+            lt = LTm[i:i+chunk]
+            mask = Mm[i:i+chunk]
+            B = h.shape[0]
+            h_state = mx.zeros((B, model.dim))
+            prev_hi = mx.zeros((B,), dtype=mx.int32)
+            prev_lo = mx.zeros((B,), dtype=mx.int32)
+            for step_t in range(max_steps):
+                hi_logits, lo_logits, h_state = model(
+                    h, s[:, step_t], t, prev_hi, prev_lo, h_state
+                )
+                m = mask[:, step_t]
+                pred_hi = mx.argmax(hi_logits, axis=-1).astype(mx.int32)
+                pred_lo = mx.argmax(lo_logits, axis=-1).astype(mx.int32)
+                correct_hi += ((pred_hi == ht[:, step_t]) * m).sum().item()
+                correct_lo += ((pred_lo == lt[:, step_t]) * m).sum().item()
+                total += m.sum().item()
+
+                if epsilon >= 1.0:
+                    prev_hi = ht[:, step_t]
+                    prev_lo = lt[:, step_t]
+                else:
+                    use_gt = mx.random.uniform(shape=(B,)) < epsilon
+                    prev_hi = mx.where(use_gt, ht[:, step_t], pred_hi)
+                    prev_lo = mx.where(use_gt, lt[:, step_t], pred_lo)
+        return min(correct_hi / total, correct_lo / total)
+
+    print(f"  Training with scheduled sampling (ε: 1.0 → 0.1)")
 
     for step in range(steps):
+        epsilon = linear_epsilon(step, steps)
         idx = mx.array(np.random.choice(n, batch_size, replace=False))
         loss, grads = nn.value_and_grad(model, loss_fn)(
-            model, Hm[idx], Sm[idx], Tm[idx], HTm[idx], LTm[idx])
+            model, Hm[idx], Sm[idx], Tm[idx], HTm[idx], LTm[idx], Mm[idx], epsilon)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
 
-        if step % 500 == 0:
-            # Chunked eval to avoid OOM on large datasets
-            chunk = 2048
-            correct_hi = correct_lo = total = 0
-            total_loss = 0.0
-            for i in range(0, n, chunk):
-                h_c = Hm[i:i+chunk]; s_c = Sm[i:i+chunk]; t_c = Tm[i:i+chunk]
-                ht_c = HTm[i:i+chunk]; lt_c = LTm[i:i+chunk]
-                hi, lo = model(h_c, s_c, t_c)
-                correct_hi += (mx.argmax(hi, axis=1) == ht_c).sum().item()
-                correct_lo += (mx.argmax(lo, axis=1) == lt_c).sum().item()
-                total += h_c.shape[0]
-                total_loss += loss_fn(model, h_c, s_c, t_c, ht_c, lt_c).item() * h_c.shape[0]
-            acc = min(correct_hi / total, correct_lo / total)
-            avg_loss = total_loss / total
-            print(f"  step {step:5d}  loss={avg_loss:.4f}  acc={acc:.1%}")
-            if acc >= 0.9999:
+        if step % 250 == 0:
+            tf_acc = eval_accuracy(1.0)
+            inf_acc = eval_accuracy(0.0)
+            print(f"  step {step:5d}  ε={epsilon:.2f}  loss={loss.item():.4f}  "
+                  f"tf_acc={tf_acc:.1%}  inf_acc={inf_acc:.1%}")
+            if inf_acc >= 0.9999:
                 mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
-                print(f"  Saved weights (acc={acc:.4%})")
-            if acc == 1.0:
+                print(f"  Saved weights (inf_acc={inf_acc:.4%})")
+            if inf_acc == 1.0:
                 perfect += 1
                 if perfect >= 2:
                     print(f"  Converged.")
@@ -390,7 +450,7 @@ N = "\033[0m"
 
 def main():
     print(f"{B}Reflex — Training{N}\n")
-    print(f"{D}Frozen backbone + flipped cross-attention control head{N}\n")
+    print(f"{D}Autoregressive control head + scheduled sampling{N}\n")
 
     backbone, tokenizer = load_backbone()
 
@@ -398,49 +458,17 @@ def main():
     tasks = generate_tasks()
     print(f"  {len(tasks)} tasks")
 
-    print(f"\n{D}Collecting traces...{N}")
+    print(f"\n{D}Collecting sequences...{N}")
     t0 = time.time()
     instr_cache = load_or_encode(tasks, backbone, tokenizer)
     print(f"  {len(instr_cache)} unique instructions")
-    S, H, T, HT, LT = collect_traces(tasks, instr_cache)
-    print(f"  {len(S)} trace steps")
+    H, T, S, HT, LT, M, max_steps = collect_sequences(tasks, instr_cache)
     print(f"  Collected in {time.time()-t0:.1f}s")
 
     print(f"\n{D}Training...{N}")
     t0 = time.time()
-    model = train(S, H, T, HT, LT, steps=60000)
+    model = train(H, T, S, HT, LT, M, max_steps, steps=80000)
     print(f"  Trained in {time.time()-t0:.1f}s")
-
-    # Validate with actual inference (no teacher forcing)
-    print(f"\n{D}Validating inference...{N}")
-    test_instrs = [
-        "draw a smiley", "draw a snake", "draw a heart", "draw a star",
-        "draw a circle", "draw a box",
-        "draw digit 7 at position 15 10", "draw a 7",
-        "compute 3 plus 5 and draw result", "3 + 5",
-        "smiley", "heart", "show me a star",
-    ]
-    chip = Chip8()
-    passed = 0
-    for instr in test_instrs:
-        chip.reset()
-        h, tid = encode_instruction(instr, backbone, tokenizer)
-        mx.eval(h)
-        for _ in range(20):
-            state = chip.get_state()
-            hi_l, lo_l = model(h, mx.array(state[None]), mx.array(tid[None]))
-            mx.eval(hi_l, lo_l)
-            opcode = (int(mx.argmax(hi_l[0]).item()) << 8) | int(mx.argmax(lo_l[0]).item())
-            if opcode == 0x0000:
-                break
-            chip.step(opcode)
-        pixels = int(chip.display.sum())
-        ok = "✓" if pixels > 0 else "✗"
-        if pixels > 0:
-            passed += 1
-        print(f"  {ok} {instr} ({pixels} pixels)")
-
-    print(f"\n  Inference: {passed}/{len(test_instrs)} pass")
 
     mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
     print(f"  Saved: weights.npz")
