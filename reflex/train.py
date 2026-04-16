@@ -24,8 +24,10 @@ from mlx.utils import tree_flatten
 from .chip8 import Chip8, PROGRAM_START
 from .model import (
     BACKBONE_DIM,
+    MAX_KV_LEN,
     MAX_TOKENS,
-    STATE_DIM,
+    OPC_BYTE_DIM,
+    TID_DIM,
     ReflexModel,
     encode_instruction,
     load_backbone,
@@ -1102,50 +1104,45 @@ def load_or_encode(tasks, backbone, tokenizer):
 
 
 def collect_sequences(tasks, instr_cache):
-    """Linear-emit, zero-state sequences. The model emits the program in
-    memory order; state is identical zeros at every step (matches the
-    inference contract). prev_opcode is the previously emitted bytes in
-    memory order (zero at step 0)."""
-    zero_state = Chip8().get_state()  # all zeros
+    """Linear-emit sequences. The model emits the program in memory order;
+    K/V at each step is the model's own opcode history (built inside the
+    train loop), so we no longer carry a state tensor here."""
     programs = []
-
     for instr, program in tasks:
         hidden, tid = instr_cache[instr]
-        states, hi_targets, lo_targets = [], [], []
+        hi_targets, lo_targets = [], []
         for emit_pc in range(PROGRAM_START, PROGRAM_START + len(program), 2):
             offset = emit_pc - PROGRAM_START
-            states.append(zero_state)
             hi_targets.append(int(program[offset]))
             lo_targets.append(int(program[offset + 1]))
         # STOP token
-        states.append(zero_state)
         hi_targets.append(0)
         lo_targets.append(0)
-        programs.append((hidden, tid, states, hi_targets, lo_targets))
+        programs.append((hidden, tid, hi_targets, lo_targets))
 
-    max_steps = max(len(s) for _, _, s, _, _ in programs)
-    max_seq = max(h.shape[0] for h, _, _, _, _ in programs)
+    max_steps = max(len(h) for _, _, h, _ in programs)
+    max_seq = max(h.shape[0] for h, _, _, _ in programs)
     n = len(programs)
 
     H = np.zeros((n, max_seq, BACKBONE_DIM), dtype=np.float32)
     T = np.zeros((n, MAX_TOKENS), dtype=np.int32)
-    S = np.zeros((n, max_steps, STATE_DIM), dtype=np.float32)
     HT = np.zeros((n, max_steps), dtype=np.int32)
     LT = np.zeros((n, max_steps), dtype=np.int32)
     M = np.zeros((n, max_steps), dtype=np.float32)
 
-    for i, (hidden, tid, states, hi_targets, lo_targets) in enumerate(programs):
+    for i, (hidden, tid, hi_targets, lo_targets) in enumerate(programs):
         H[i, :hidden.shape[0], :] = hidden
         T[i] = tid
-        for j in range(len(states)):
-            S[i, j] = states[j]
+        for j in range(len(hi_targets)):
             HT[i, j] = hi_targets[j]
             LT[i, j] = lo_targets[j]
             M[i, j] = 1.0
 
     total = int(M.sum())
     print(f"  {n} programs, {total} total steps, max {max_steps} steps/program")
-    return H, T, S, HT, LT, M, max_steps
+    if max_steps > MAX_KV_LEN:
+        raise ValueError(f"max_steps ({max_steps}) exceeds MAX_KV_LEN ({MAX_KV_LEN})")
+    return H, T, HT, LT, M, max_steps
 
 
 # ── Training ──────────────────────────────────────────────────────────
@@ -1156,14 +1153,21 @@ def linear_epsilon(step, total_steps, start=1.0, end=0.1):
     return start + (end - start) * t
 
 
-def train(H, T, S, HT, LT, M, max_steps, steps=80000):
+def _update_history(history: mx.array, step_t: int, new_op: mx.array) -> mx.array:
+    """Functional update: write `new_op` (shape [B]) into column step_t of
+    `history` (shape [B, MAX_KV_LEN])."""
+    col_mask = mx.arange(MAX_KV_LEN) == step_t            # [MAX_KV_LEN] bool
+    new_col = mx.broadcast_to(new_op[:, None], history.shape)
+    return mx.where(col_mask[None, :], new_col, history)
+
+
+def train(H, T, HT, LT, M, max_steps, steps=80000):
     model = ReflexModel()
     scheduler = optim.cosine_decay(3e-4, steps, end=1e-6)
     optimizer = optim.Adam(learning_rate=scheduler)
 
     Hm = mx.array(H)
     Tm = mx.array(T)
-    Sm = mx.array(S)
     HTm = mx.array(HT)
     LTm = mx.array(LT)
     Mm = mx.array(M)
@@ -1171,16 +1175,18 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
     batch_size = min(32, n)
     perfect = 0
 
-    def loss_fn(model, h, s, t, ht, lt, mask, epsilon):
-        B = s.shape[0]
+    def loss_fn(model, h, t, ht, lt, mask, epsilon):
+        B = h.shape[0]
         h_state = mx.zeros((B, model.dim))
         prev_hi = mx.zeros((B,), dtype=mx.int32)
         prev_lo = mx.zeros((B,), dtype=mx.int32)
+        history = mx.zeros((B, MAX_KV_LEN), dtype=mx.int32)
         total_loss = mx.array(0.0)
 
         for step_t in range(max_steps):
+            # K/V valid count = start token (1) + opcodes emitted so far (step_t)
             hi_logits, lo_logits, h_state = model(
-                h, s[:, step_t], t, prev_hi, prev_lo, h_state
+                h, history, step_t + 1, t, prev_hi, prev_lo, h_state
             )
             loss_hi = nn.losses.cross_entropy(hi_logits, ht[:, step_t]) * mask[:, step_t]
             loss_lo = nn.losses.cross_entropy(lo_logits, lt[:, step_t]) * mask[:, step_t]
@@ -1192,16 +1198,16 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
             pred_lo = mx.argmax(mx.stop_gradient(lo_logits), axis=-1).astype(mx.int32)
             prev_hi = mx.where(use_gt, ht[:, step_t], pred_hi)
             prev_lo = mx.where(use_gt, lt[:, step_t], pred_lo)
+            new_op = (prev_hi << 8) | prev_lo
+            history = _update_history(history, step_t, new_op)
 
         return total_loss / mask.sum()
 
     # Eval on a fixed random subset to keep iteration time tractable.
-    # Full-set accuracy has been seen to track subset accuracy closely.
     eval_subset_size = min(1024, n)
     np.random.seed(0)
     eval_idx = np.sort(np.random.choice(n, eval_subset_size, replace=False))
     Hev = Hm[mx.array(eval_idx)]
-    Sev = Sm[mx.array(eval_idx)]
     Tev = Tm[mx.array(eval_idx)]
     HTev = HTm[mx.array(eval_idx)]
     LTev = LTm[mx.array(eval_idx)]
@@ -1215,7 +1221,6 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
         correct_hi = correct_lo = total = 0
         for i in range(0, n_ev, chunk):
             h = Hev[i:i+chunk]
-            s = Sev[i:i+chunk]
             t = Tev[i:i+chunk]
             ht = HTev[i:i+chunk]
             lt = LTev[i:i+chunk]
@@ -1224,9 +1229,10 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
             h_state = mx.zeros((B, model.dim))
             prev_hi = mx.zeros((B,), dtype=mx.int32)
             prev_lo = mx.zeros((B,), dtype=mx.int32)
+            history = mx.zeros((B, MAX_KV_LEN), dtype=mx.int32)
             for step_t in range(max_steps):
                 hi_logits, lo_logits, h_state = model(
-                    h, s[:, step_t], t, prev_hi, prev_lo, h_state
+                    h, history, step_t + 1, t, prev_hi, prev_lo, h_state
                 )
                 m = mask[:, step_t]
                 pred_hi = mx.argmax(hi_logits, axis=-1).astype(mx.int32)
@@ -1242,6 +1248,8 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
                     use_gt = mx.random.uniform(shape=(B,)) < epsilon
                     prev_hi = mx.where(use_gt, ht[:, step_t], pred_hi)
                     prev_lo = mx.where(use_gt, lt[:, step_t], pred_lo)
+                new_op = (prev_hi << 8) | prev_lo
+                history = _update_history(history, step_t, new_op)
         return min(correct_hi / total, correct_lo / total)
 
     print(f"  Training with scheduled sampling (ε: 1.0 → 0.1)")
@@ -1250,7 +1258,7 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
         epsilon = linear_epsilon(step, steps)
         idx = mx.array(np.random.choice(n, batch_size, replace=False))
         loss, grads = nn.value_and_grad(model, loss_fn)(
-            model, Hm[idx], Sm[idx], Tm[idx], HTm[idx], LTm[idx], Mm[idx], epsilon)
+            model, Hm[idx], Tm[idx], HTm[idx], LTm[idx], Mm[idx], epsilon)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
 
@@ -1296,12 +1304,12 @@ def main():
     t0 = time.time()
     instr_cache = load_or_encode(tasks, backbone, tokenizer)
     print(f"  {len(instr_cache)} unique instructions")
-    H, T, S, HT, LT, M, max_steps = collect_sequences(tasks, instr_cache)
+    H, T, HT, LT, M, max_steps = collect_sequences(tasks, instr_cache)
     print(f"  Collected in {time.time()-t0:.1f}s")
 
     print(f"\n{D}Training...{N}")
     t0 = time.time()
-    model = train(H, T, S, HT, LT, M, max_steps, steps=15000)
+    model = train(H, T, HT, LT, M, max_steps, steps=15000)
     print(f"  Trained in {time.time()-t0:.1f}s")
 
     mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))

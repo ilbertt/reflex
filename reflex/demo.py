@@ -21,7 +21,7 @@ import mlx.core as mx
 import numpy as np
 
 from .chip8 import Chip8, DISPLAY_SIZE, PROGRAM_START
-from .model import STATE_DIM, ReflexModel, encode_instruction, load_backbone
+from .model import MAX_KV_LEN, ReflexModel, encode_instruction, load_backbone
 
 B = "\033[1m"
 D = "\033[2m"
@@ -134,14 +134,18 @@ EXEC_MAX_CYCLES = 2000
 
 def emit_program_stream(model, h, tid, max_steps: int = EMIT_MAX_STEPS):
     """Generator: yields (opcode_int, emit_us_for_this_op) per step.
-    Stops on STOP token (0x0000) or after max_steps. Callee assembles bytes."""
-    zero_state = mx.zeros((1, STATE_DIM))
+    Stops on STOP token (0x0000) or after max_steps. Callee assembles bytes.
+
+    Maintains a [1, MAX_KV_LEN] opcode-history tensor that's passed as K/V
+    on each forward pass — same contract as the training loop."""
     h_state = None
     prev_hi = prev_lo = None
-    for _ in range(max_steps):
+    history = mx.zeros((1, MAX_KV_LEN), dtype=mx.int32)
+    tid_m = mx.array(tid[None])
+    for step_t in range(min(max_steps, MAX_KV_LEN)):
         t0 = time.perf_counter()
         hi_l, lo_l, h_state = model(
-            h, zero_state, mx.array(tid[None]),
+            h, history, step_t + 1, tid_m,
             prev_hi, prev_lo, h_state,
         )
         mx.eval(hi_l, lo_l, h_state)
@@ -154,6 +158,10 @@ def emit_program_stream(model, h, tid, max_steps: int = EMIT_MAX_STEPS):
         yield opcode, dt_us
         prev_hi = mx.array([hi], dtype=mx.int32)
         prev_lo = mx.array([lo], dtype=mx.int32)
+        # Append to history at column step_t.
+        col_mask = mx.arange(MAX_KV_LEN) == step_t
+        new_col = mx.broadcast_to(mx.array([opcode], dtype=mx.int32)[:, None], history.shape)
+        history = mx.where(col_mask[None, :], new_col, history)
 
 
 def emit_program(model, h, tid, max_steps: int = EMIT_MAX_STEPS) -> tuple[bytes, float]:
@@ -542,9 +550,8 @@ def main():
         print(f"{D}Warming up...{N}")
         _h, _tid = encode_instruction("warmup", backbone, tokenizer)
         mx.eval(_h)
-        _hi, _lo, _hs = model(
-            _h, mx.zeros((1, STATE_DIM)), mx.array(_tid[None]),
-        )
+        _hist = mx.zeros((1, MAX_KV_LEN), dtype=mx.int32)
+        _hi, _lo, _hs = model(_h, _hist, 1, mx.array(_tid[None]))
         mx.eval(_hi, _lo, _hs)
         run_persistent_tui(chip, model, backbone, tokenizer)
     else:

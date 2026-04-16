@@ -47,7 +47,6 @@ class Chip8:
         self.pc = PROGRAM_START
         self.sp = 0
         self.stack = np.zeros(16, dtype=np.uint16)
-        self.prev_opcode = 0
         self.delay_timer = 0
 
     def load_program(self, data: bytes):
@@ -56,30 +55,9 @@ class Chip8:
             if PROGRAM_START + i < MEMORY_SIZE:
                 self.memory[PROGRAM_START + i] = b
 
-    def get_state(self) -> np.ndarray:
-        """Machine state: display + registers + prev opcode. No memory window."""
-        dim = DISPLAY_SIZE + 16 + 2 + 2  # 2068
-        state = np.zeros(dim, dtype=np.float32)
-        offset = 0
-
-        state[offset:offset + DISPLAY_SIZE] = self.display.astype(np.float32)
-        offset += DISPLAY_SIZE
-
-        state[offset:offset + 16] = self.V / 255.0
-        offset += 16
-
-        state[offset] = (self.I & 0xFF) / 255.0
-        state[offset + 1] = ((self.I >> 8) & 0xFF) / 255.0
-        offset += 2
-
-        state[offset] = ((self.prev_opcode >> 8) & 0xFF) / 255.0
-        state[offset + 1] = (self.prev_opcode & 0xFF) / 255.0
-        return state
-
     def step(self, opcode: int) -> bool:
         """Execute one opcode. Returns True if display changed."""
         opcode = int(opcode)
-        self.prev_opcode = opcode
         if self.delay_timer > 0:
             self.delay_timer -= 1
         display_changed = False
