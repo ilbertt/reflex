@@ -63,19 +63,14 @@ def prog_draw_sprite(name: str, sprite_bytes: list[int], x: int, y: int) -> byte
     height = len(sprite_bytes)
     ops = [0x00E0]  # clear
 
-    # Store sprite bytes in memory at 0x300 using registers + Fx55
-    # Load each byte into V0..Vn, set I=0x300, store
-    for i, b in enumerate(sprite_bytes[:8]):  # max 8 rows (V0-V7)
-        ops.append(0x6000 | (i << 8) | (b & 0xFF))  # Vi = byte
-    ops.append(0xA300)  # I = 0x300
-    ops.append(0xF055 | ((min(height, 8) - 1) << 8))  # store V0..Vn at I
+    for i, b in enumerate(sprite_bytes[:8]):
+        ops.append(0x6000 | (i << 8) | (b & 0xFF))
+    ops.append(0xA300)
+    ops.append(0xF055 | ((min(height, 8) - 1) << 8))
 
-    # Set draw position
-    ops.append(0x6000 | (8 << 8) | (x & 0xFF))   # V8 = x
-    ops.append(0x6000 | (9 << 8) | (y & 0xFF))   # V9 = y
-    ops.append(0xA300)  # I = 0x300
-
-    # Draw sprite: D89n where n = height
+    ops.append(0x6000 | (8 << 8) | (x & 0xFF))
+    ops.append(0x6000 | (9 << 8) | (y & 0xFF))
+    ops.append(0xA300)
     ops.append(0xD890 | (min(height, 8) & 0xF))
 
     return b"".join(struct.pack(">H", op) for op in ops)
@@ -105,41 +100,155 @@ SPRITES = {
     "letter H": [0x82, 0x82, 0x82, 0xFE, 0x82, 0x82, 0x82],
 }
 
+# Digit names for natural phrasing
+DIGIT_NAMES = {
+    0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
+    5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
+}
+
+
+# ── Phrasing generation ──────────────────────────────────────────────
+
+def digit_phrasings(digit: int, x: int, y: int) -> list[str]:
+    """Generate many natural phrasings for digit drawing."""
+    d = f"{digit:X}"
+    phrases = [
+        f"draw digit {d} at position {x} {y}",
+        f"draw digit {d} at {x} {y}",
+        f"digit {d} at position {x} {y}",
+        f"digit {d} at {x} {y}",
+        f"put digit {d} at {x} {y}",
+        f"show digit {d} at position {x} {y}",
+    ]
+    # Short phrasings (only at default-ish positions to avoid ambiguity)
+    if x == 10 and y == 10:
+        phrases += [
+            f"draw digit {d}",
+            f"draw a {d}",
+            f"draw {d}",
+            f"show {d}",
+            f"display {d}",
+            f"{d}",
+            f"render {d}",
+            f"number {d}",
+            f"show me {d}",
+            f"put {d} on screen",
+            f"the number {d}",
+        ]
+        if digit in DIGIT_NAMES:
+            name = DIGIT_NAMES[digit]
+            phrases += [
+                f"draw {name}",
+                f"draw a {name}",
+                f"show {name}",
+                f"the number {name}",
+                f"{name}",
+            ]
+    return phrases
+
+
+def arithmetic_phrasings(a: int, b: int) -> list[str]:
+    """Generate natural phrasings for arithmetic."""
+    return [
+        f"compute {a} plus {b} and draw result",
+        f"add {a} and {b}",
+        f"calculate {a} + {b}",
+        f"{a} + {b}",
+        f"{a} plus {b}",
+        f"compute {a}+{b}",
+        f"what is {a} + {b}",
+        f"sum of {a} and {b}",
+        f"add {a} to {b}",
+        f"show {a} + {b}",
+        f"draw {a} + {b}",
+        f"result of {a} plus {b}",
+    ]
+
+
+def sprite_phrasings(name: str) -> list[str]:
+    """Generate natural phrasings for sprite drawing."""
+    return [
+        f"draw a {name}",
+        f"draw {name}",
+        f"show me a {name}",
+        f"show a {name}",
+        f"show {name}",
+        f"display {name}",
+        f"display a {name}",
+        f"render a {name}",
+        f"render {name}",
+        f"create a {name}",
+        f"make a {name}",
+        f"put a {name}",
+        f"{name}",
+        f"a {name}",
+        f"draw me a {name}",
+        f"can you draw a {name}",
+        f"please draw a {name}",
+        f"i want a {name}",
+        f"show me {name}",
+    ]
+
+
+def sprite_position_phrasings(name: str, x: int, y: int) -> list[str]:
+    """Phrasings for sprite at specific position."""
+    return [
+        f"draw {name} at position {x} {y}",
+        f"draw a {name} at position {x} {y}",
+        f"draw {name} at {x} {y}",
+        f"{name} at position {x} {y}",
+        f"put a {name} at {x} {y}",
+        f"show {name} at {x} {y}",
+    ]
+
+
+def two_digit_phrasings(d1: int, d2: int) -> list[str]:
+    """Phrasings for two-digit display."""
+    a, b = f"{d1:X}", f"{d2:X}"
+    return [
+        f"draw digits {a} and {b}",
+        f"show digits {a} and {b}",
+        f"display {a} and {b}",
+        f"draw {a} and {b}",
+        f"{a} and {b}",
+        f"show {a} {b}",
+        f"digits {a} {b}",
+    ]
+
 
 def generate_tasks() -> list[tuple[str, bytes]]:
     tasks = []
 
-    # Digit drawing
+    # Digit drawing with many phrasings
     for digit in range(16):
         for x in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]:
             for y in [5, 10, 15, 20, 25]:
-                tasks.append((f"draw digit {digit:X} at position {x} {y}",
-                              prog_draw_digit(digit, x, y)))
+                for phrase in digit_phrasings(digit, x, y):
+                    tasks.append((phrase, prog_draw_digit(digit, x, y)))
 
     # Two digits
     for d1 in range(16):
         for d2 in range(16):
-            tasks.append((f"draw digits {d1:X} and {d2:X}",
-                          prog_draw_two_digits(d1, d2)))
+            for phrase in two_digit_phrasings(d1, d2):
+                tasks.append((phrase, prog_draw_two_digits(d1, d2)))
 
-    # Arithmetic
+    # Arithmetic with many phrasings
     for a in range(10):
         for b in range(10):
-            tasks.append((f"compute {a} plus {b} and draw result",
-                          prog_add_and_draw(a, b)))
+            for phrase in arithmetic_phrasings(a, b):
+                tasks.append((phrase, prog_add_and_draw(a, b)))
 
     # Custom sprites at various positions
     for name, sprite in SPRITES.items():
         for x in [5, 15, 25, 35]:
             for y in [3, 10, 18]:
-                tasks.append((f"draw {name} at position {x} {y}",
-                              prog_draw_sprite(name, sprite, x, y)))
+                for phrase in sprite_position_phrasings(name, x, y):
+                    tasks.append((phrase, prog_draw_sprite(name, sprite, x, y)))
 
-    # Alternative phrasings at default position
+    # Sprites at default position with many phrasings
     for name, sprite in SPRITES.items():
-        for phrasing in [f"draw a {name}", f"show me a {name}", f"display {name}",
-                         f"render a {name}", f"create a {name}", f"make a {name}"]:
-            tasks.append((phrasing, prog_draw_sprite(name, sprite, 20, 10)))
+        for phrase in sprite_phrasings(name):
+            tasks.append((phrase, prog_draw_sprite(name, sprite, 20, 10)))
 
     return tasks
 
@@ -151,7 +260,6 @@ def load_or_encode(tasks, backbone, tokenizer):
     import os
     import hashlib
 
-    # Hash task list to detect changes
     task_hash = hashlib.md5(str(sorted(set(i for i, _ in tasks))).encode()).hexdigest()[:8]
     cache_file = f"encoding_cache_{task_hash}.npz"
 
@@ -162,11 +270,14 @@ def load_or_encode(tasks, backbone, tokenizer):
 
     print("  Encoding instructions through backbone...")
     instr_cache = {}
-    for instr, _ in tasks:
+    unique = set(i for i, _ in tasks)
+    for idx, instr in enumerate(sorted(unique)):
         if instr not in instr_cache:
             h, tid = encode_instruction(instr, backbone, tokenizer)
             mx.eval(h)
             instr_cache[instr] = (np.array(h[0]), tid)
+        if (idx + 1) % 500 == 0:
+            print(f"    {idx + 1}/{len(unique)} encoded...")
 
     np.savez(cache_file, cache=instr_cache)
     print(f"  Cached {len(instr_cache)} encodings to {cache_file}")
@@ -196,7 +307,7 @@ def collect_traces(tasks, instr_cache):
 
             chip.step((hi << 8) | lo)
 
-        # After last opcode: teach the model to emit STOP (0x0000)
+        # STOP token
         state = chip.get_state()
         states.append(state)
         hiddens.append(hidden)
@@ -217,9 +328,9 @@ def collect_traces(tasks, instr_cache):
 
 # ── Training ───────────────────────────────────────────────────────────
 
-def train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4, label=""):
-    """Core training loop. Returns model with updated weights."""
-    scheduler = optim.cosine_decay(lr, steps, end=1e-6)
+def train(S, H, T, HT, LT, steps=60000):
+    model = ReflexModel()
+    scheduler = optim.cosine_decay(5e-4, steps, end=1e-6)
     optimizer = optim.Adam(learning_rate=scheduler)
 
     Sm, Hm, Tm = mx.array(S), mx.array(H), mx.array(T)
@@ -241,10 +352,21 @@ def train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4, label=""):
         mx.eval(model.parameters(), optimizer.state)
 
         if step % 500 == 0:
-            hi, lo = model(Hm, Sm, Tm)
-            acc = min((mx.argmax(hi, axis=1) == HTm).mean().item(),
-                      (mx.argmax(lo, axis=1) == LTm).mean().item())
-            print(f"  {label}step {step:5d}  loss={loss_fn(model, Hm, Sm, Tm, HTm, LTm).item():.4f}  acc={acc:.1%}")
+            # Chunked eval to avoid OOM on large datasets
+            chunk = 2048
+            correct_hi = correct_lo = total = 0
+            total_loss = 0.0
+            for i in range(0, n, chunk):
+                h_c = Hm[i:i+chunk]; s_c = Sm[i:i+chunk]; t_c = Tm[i:i+chunk]
+                ht_c = HTm[i:i+chunk]; lt_c = LTm[i:i+chunk]
+                hi, lo = model(h_c, s_c, t_c)
+                correct_hi += (mx.argmax(hi, axis=1) == ht_c).sum().item()
+                correct_lo += (mx.argmax(lo, axis=1) == lt_c).sum().item()
+                total += h_c.shape[0]
+                total_loss += loss_fn(model, h_c, s_c, t_c, ht_c, lt_c).item() * h_c.shape[0]
+            acc = min(correct_hi / total, correct_lo / total)
+            avg_loss = total_loss / total
+            print(f"  step {step:5d}  loss={avg_loss:.4f}  acc={acc:.1%}")
             if acc >= 0.9999:
                 mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
                 print(f"  Saved weights (acc={acc:.4%})")
@@ -255,100 +377,6 @@ def train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4, label=""):
                     return model
             else:
                 perfect = 0
-
-    return model
-
-
-def collect_dagger_traces(model, tasks, instr_cache, mix_rate=0.5):
-    """Mixed-rollout DAgger: at each step, follow model's prediction with
-    probability mix_rate, otherwise follow correct opcode. This keeps states
-    close to training data while exposing the model to mild perturbations.
-    """
-    chip = Chip8()
-    states, hiddens, tids, high_targets, low_targets = [], [], [], [], []
-    n_off_policy = 0
-
-    for instr, program in tasks:
-        hidden, tid = instr_cache[instr]
-        opcodes = []
-        for i in range(0, len(program), 2):
-            opcodes.append((program[i] << 8) | program[i + 1])
-
-        chip.load_program(program)
-
-        for k, correct_opcode in enumerate(opcodes):
-            state = chip.get_state()
-
-            h_mx = mx.array(hidden[None])
-            s_mx = mx.array(state[None])
-            t_mx = mx.array(tid[None])
-            hi_l, lo_l = model(h_mx, s_mx, t_mx)
-            mx.eval(hi_l, lo_l)
-            predicted = (int(mx.argmax(hi_l[0]).item()) << 8) | int(mx.argmax(lo_l[0]).item())
-
-            if predicted != correct_opcode:
-                states.append(state)
-                hiddens.append(hidden)
-                tids.append(tid)
-                high_targets.append((correct_opcode >> 8) & 0xFF)
-                low_targets.append(correct_opcode & 0xFF)
-                n_off_policy += 1
-
-            # Mixed rollout: sometimes follow model, sometimes follow ground truth
-            if predicted != 0x0000 and np.random.random() < mix_rate:
-                chip.step(predicted)
-            else:
-                chip.step(correct_opcode)
-
-        # STOP token
-        state = chip.get_state()
-        states.append(state)
-        hiddens.append(hidden)
-        tids.append(tid)
-        high_targets.append(0)
-        low_targets.append(0)
-
-    if not states:
-        return None
-
-    max_seq = max(h.shape[0] for h in hiddens)
-    H = np.zeros((len(hiddens), max_seq, BACKBONE_DIM), dtype=np.float32)
-    for i, h in enumerate(hiddens):
-        H[i, :h.shape[0], :] = h
-
-    print(f"  DAgger: {n_off_policy} off-policy states from {len(tasks)} tasks")
-    return (np.stack(states), H, np.stack(tids),
-            np.array(high_targets, dtype=np.int32),
-            np.array(low_targets, dtype=np.int32))
-
-
-def train(S, H, T, HT, LT, tasks, instr_cache, dagger_rounds=3):
-    model = ReflexModel()
-
-    # Phase 1: teacher-forced training
-    model = train_loop(model, S, H, T, HT, LT, steps=60000, lr=5e-4)
-
-    # Phase 2: DAgger rounds — ramp mix_rate from gentle to aggressive
-    mix_rates = [0.3, 0.5, 0.7]
-    for rnd in range(dagger_rounds):
-        mix = mix_rates[rnd] if rnd < len(mix_rates) else 0.7
-        print(f"\n  DAgger round {rnd + 1}/{dagger_rounds} (mix_rate={mix})...")
-        dagger = collect_dagger_traces(model, tasks, instr_cache, mix_rate=mix)
-        if dagger is None or len(dagger[0]) == 0:
-            print(f"  No off-policy states — model is perfect at inference!")
-            break
-
-        # Merge original + DAgger data
-        dS, dH, dT, dHT, dLT = dagger
-        mS = np.concatenate([S, dS])
-        mH = np.concatenate([H, dH])
-        mT = np.concatenate([T, dT])
-        mHT = np.concatenate([HT, dHT])
-        mLT = np.concatenate([LT, dLT])
-        print(f"  Training on {len(mS)} samples ({len(dS)} new)")
-
-        model = train_loop(model, mS, mH, mT, mHT, mLT,
-                           steps=30000, lr=2e-4, label=f"[D{rnd+1}] ")
 
     return model
 
@@ -378,16 +406,19 @@ def main():
     print(f"  {len(S)} trace steps")
     print(f"  Collected in {time.time()-t0:.1f}s")
 
-    print(f"\n{D}Training (with DAgger)...{N}")
+    print(f"\n{D}Training...{N}")
     t0 = time.time()
-    model = train(S, H, T, HT, LT, tasks, instr_cache)
+    model = train(S, H, T, HT, LT, steps=60000)
     print(f"  Trained in {time.time()-t0:.1f}s")
 
     # Validate with actual inference (no teacher forcing)
     print(f"\n{D}Validating inference...{N}")
     test_instrs = [
         "draw a smiley", "draw a snake", "draw a heart", "draw a star",
-        "draw digit 7 at position 15 10", "compute 3 plus 5 and draw result",
+        "draw a circle", "draw a box",
+        "draw digit 7 at position 15 10", "draw a 7",
+        "compute 3 plus 5 and draw result", "3 + 5",
+        "smiley", "heart", "show me a star",
     ]
     chip = Chip8()
     passed = 0

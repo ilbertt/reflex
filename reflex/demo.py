@@ -115,12 +115,16 @@ def main():
 
     if interactive:
         print(f"\n{D}Type an instruction. The model generates opcodes from understanding alone.{N}")
-        print(f"{D}Try:{N}")
-        print(f"{D}  draw a smiley              draw a circle{N}")
-        print(f"{D}  draw digit 7 at position 15 10{N}")
-        print(f"{D}  draw digit A at position 30 5{N}")
-        print(f"{D}  draw digit 0 at position 10 20{N}")
-        print(f"{D}Digits 0-F, positions 5-50 x 5-25. Type 'quit' to exit.{N}\n")
+        print(f"{D}Works best with these patterns:{N}")
+        print(f"{D}  Sprites:   draw a smiley    |  draw a heart    |  draw a circle{N}")
+        print(f"{D}             draw a star      |  draw a cross    |  draw a diamond{N}")
+        print(f"{D}             smiley           |  circle          |  a heart{N}")
+        print(f"{D}  Digits:    draw digit 7     |  draw digit A    |  digit 3 at 20 20{N}")
+        print(f"{D}             draw digit 5 at position 30 15{N}")
+        print(f"{D}             draw digits A and B{N}")
+        print(f"{D}  Math:      3 + 5            |  add three and five{N}")
+        print(f"{D}             compute 3 plus 5 and draw result{N}")
+        print(f"{D}Type 'quit' to exit.{N}\n")
 
         while True:
             try:
