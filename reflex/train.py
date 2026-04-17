@@ -13,11 +13,11 @@ import os
 import struct
 import time
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import numpy as np
-from mlx.utils import tree_flatten
 
 from .chip8 import Chip8, PROGRAM_START
 from .model import (
@@ -31,6 +31,7 @@ from .model import (
 
 
 # ── Programs ───────────────────────────────────────────────────────────
+
 
 def prog_draw_digit(digit: int, x: int = 10, y: int = 10) -> bytes:
     ops = [
@@ -49,10 +50,12 @@ def prog_draw_two_digits(d1: int, d2: int) -> bytes:
         0x6000 | (0 << 8) | 10,
         0x6000 | (1 << 8) | 10,
         0x6000 | (2 << 8) | (d1 & 0xF),
-        0xF229, 0xD015,
+        0xF229,
+        0xD015,
         0x6000 | (0 << 8) | 18,
         0x6000 | (2 << 8) | (d2 & 0xF),
-        0xF229, 0xD015,
+        0xF229,
+        0xD015,
     ]
     return b"".join(struct.pack(">H", op) for op in ops)
 
@@ -110,12 +113,21 @@ SPRITES = {
 }
 
 DIGIT_NAMES = {
-    0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
-    5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine",
+    0: "zero",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
 }
 
 
 # ── Phrasing generation ──────────────────────────────────────────────
+
 
 def digit_phrasings(digit: int, x: int, y: int) -> list[str]:
     d = f"{digit:X}"
@@ -252,9 +264,12 @@ def generate_tasks() -> list[tuple[str, bytes]]:
 
 # ── Data collection ────────────────────────────────────────────────────
 
-def load_or_encode(tasks, backbone, tokenizer):
+
+def load_or_encode(tasks, backbone, tokenizer, device="cuda"):
     """Cache backbone encodings to disk — saves ~5 min per run."""
-    task_hash = hashlib.md5(str(sorted(set(i for i, _ in tasks))).encode()).hexdigest()[:8]
+    task_hash = hashlib.md5(str(sorted(set(i for i, _ in tasks))).encode()).hexdigest()[
+        :8
+    ]
     cache_file = f"encoding_cache_{task_hash}.npz"
 
     if os.path.exists(cache_file):
@@ -266,9 +281,8 @@ def load_or_encode(tasks, backbone, tokenizer):
     instr_cache = {}
     unique = sorted(set(i for i, _ in tasks))
     for idx, instr in enumerate(unique):
-        h, tid = encode_instruction(instr, backbone, tokenizer)
-        mx.eval(h)
-        instr_cache[instr] = (np.array(h[0]), tid)
+        h, tid = encode_instruction(instr, backbone, tokenizer, device)
+        instr_cache[instr] = (h.cpu().numpy()[0], tid)
         if (idx + 1) % 500 == 0:
             print(f"    {idx + 1}/{len(unique)} encoded...")
 
@@ -317,7 +331,7 @@ def collect_sequences(tasks, instr_cache):
     M = np.zeros((n, max_steps), dtype=np.float32)
 
     for i, (hidden, tid, states, hi_targets, lo_targets) in enumerate(programs):
-        H[i, :hidden.shape[0], :] = hidden
+        H[i, : hidden.shape[0], :] = hidden
         T[i] = tid
         for j in range(len(states)):
             S[i, j] = states[j]
@@ -332,103 +346,125 @@ def collect_sequences(tasks, instr_cache):
 
 # ── Training ───────────────────────────────────────────────────────────
 
+
 def linear_epsilon(step, total_steps, start=1.0, end=0.1):
     """Linear decay for scheduled sampling probability."""
     t = min(step / total_steps, 1.0)
     return start + (end - start) * t
 
 
-def train(H, T, S, HT, LT, M, max_steps, steps=80000):
-    model = ReflexModel()
-    scheduler = optim.cosine_decay(3e-4, steps, end=1e-6)
-    optimizer = optim.Adam(learning_rate=scheduler)
+def train(H, T, S, HT, LT, M, max_steps, steps=80000, device="cuda"):
+    model = ReflexModel().to(device)
 
-    Hm = mx.array(H)
-    Tm = mx.array(T)
-    Sm = mx.array(S)
-    HTm = mx.array(HT)
-    LTm = mx.array(LT)
-    Mm = mx.array(M)
+    def scheduler(step):
+        return 3e-4 * 0.5 * (1 + np.cos(np.pi * step / steps))
+
+    optimizer = optim.Adam(model.parameters(), lr=3e-4)
+
+    Hm = torch.tensor(H, dtype=torch.float32, device=device)
+    Tm = torch.tensor(T, dtype=torch.int32, device=device)
+    Sm = torch.tensor(S, dtype=torch.float32, device=device)
+    HTm = torch.tensor(HT, dtype=torch.int64, device=device)
+    LTm = torch.tensor(LT, dtype=torch.int64, device=device)
+    Mm = torch.tensor(M, dtype=torch.float32, device=device)
     n = len(H)
     batch_size = min(32, n)
-    perfect = 0
 
     def loss_fn(model, h, s, t, ht, lt, mask, epsilon):
         B = s.shape[0]
-        h_state = mx.zeros((B, model.dim))
-        prev_hi = mx.zeros((B,), dtype=mx.int32)
-        prev_lo = mx.zeros((B,), dtype=mx.int32)
-        total_loss = mx.array(0.0)
+        h_state = torch.zeros((B, model.dim), device=device)
+        prev_hi = torch.zeros((B,), dtype=torch.int32, device=device)
+        prev_lo = torch.zeros((B,), dtype=torch.int32, device=device)
+        total_loss = torch.tensor(0.0, device=device)
 
         for step_t in range(max_steps):
             hi_logits, lo_logits, h_state = model(
                 h, s[:, step_t], t, prev_hi, prev_lo, h_state
             )
-            loss_hi = nn.losses.cross_entropy(hi_logits, ht[:, step_t]) * mask[:, step_t]
-            loss_lo = nn.losses.cross_entropy(lo_logits, lt[:, step_t]) * mask[:, step_t]
+            loss_hi = (
+                F.cross_entropy(hi_logits, ht[:, step_t], reduction="none")
+                * mask[:, step_t]
+            )
+            loss_lo = (
+                F.cross_entropy(lo_logits, lt[:, step_t], reduction="none")
+                * mask[:, step_t]
+            )
             total_loss = total_loss + (loss_hi + loss_lo).sum()
 
             # Scheduled sampling: GT with prob ε, else model's own argmax (detached)
-            use_gt = mx.random.uniform(shape=(B,)) < epsilon
-            pred_hi = mx.argmax(mx.stop_gradient(hi_logits), axis=-1).astype(mx.int32)
-            pred_lo = mx.argmax(mx.stop_gradient(lo_logits), axis=-1).astype(mx.int32)
-            prev_hi = mx.where(use_gt, ht[:, step_t], pred_hi)
-            prev_lo = mx.where(use_gt, lt[:, step_t], pred_lo)
+            use_gt = torch.rand((B,), device=device) < epsilon
+            pred_hi = torch.argmax(hi_logits.detach(), dim=-1).to(torch.int32)
+            pred_lo = torch.argmax(lo_logits.detach(), dim=-1).to(torch.int32)
+            prev_hi = torch.where(use_gt, ht[:, step_t], pred_hi)
+            prev_lo = torch.where(use_gt, lt[:, step_t], pred_lo)
 
         return total_loss / mask.sum()
 
     def eval_accuracy(epsilon):
         """Evaluate at given ε (1.0 = teacher forcing, 0.0 = pure inference)."""
+        model.eval()
         chunk = 64
         correct_hi = correct_lo = total = 0
-        for i in range(0, n, chunk):
-            h = Hm[i:i+chunk]
-            s = Sm[i:i+chunk]
-            t = Tm[i:i+chunk]
-            ht = HTm[i:i+chunk]
-            lt = LTm[i:i+chunk]
-            mask = Mm[i:i+chunk]
-            B = h.shape[0]
-            h_state = mx.zeros((B, model.dim))
-            prev_hi = mx.zeros((B,), dtype=mx.int32)
-            prev_lo = mx.zeros((B,), dtype=mx.int32)
-            for step_t in range(max_steps):
-                hi_logits, lo_logits, h_state = model(
-                    h, s[:, step_t], t, prev_hi, prev_lo, h_state
-                )
-                m = mask[:, step_t]
-                pred_hi = mx.argmax(hi_logits, axis=-1).astype(mx.int32)
-                pred_lo = mx.argmax(lo_logits, axis=-1).astype(mx.int32)
-                correct_hi += ((pred_hi == ht[:, step_t]) * m).sum().item()
-                correct_lo += ((pred_lo == lt[:, step_t]) * m).sum().item()
-                total += m.sum().item()
+        with torch.no_grad():
+            for i in range(0, n, chunk):
+                h = Hm[i : i + chunk]
+                s = Sm[i : i + chunk]
+                t = Tm[i : i + chunk]
+                ht = HTm[i : i + chunk]
+                lt = LTm[i : i + chunk]
+                mask = Mm[i : i + chunk]
+                B = h.shape[0]
+                h_state = torch.zeros((B, model.dim), device=device)
+                prev_hi = torch.zeros((B,), dtype=torch.int32, device=device)
+                prev_lo = torch.zeros((B,), dtype=torch.int32, device=device)
+                for step_t in range(max_steps):
+                    hi_logits, lo_logits, h_state = model(
+                        h, s[:, step_t], t, prev_hi, prev_lo, h_state
+                    )
+                    m = mask[:, step_t]
+                    pred_hi = torch.argmax(hi_logits, dim=-1).to(torch.int32)
+                    pred_lo = torch.argmax(lo_logits, dim=-1).to(torch.int32)
+                    correct_hi += ((pred_hi == ht[:, step_t]) * m).sum().item()
+                    correct_lo += ((pred_lo == lt[:, step_t]) * m).sum().item()
+                    total += m.sum().item()
 
-                if epsilon >= 1.0:
-                    prev_hi = ht[:, step_t]
-                    prev_lo = lt[:, step_t]
-                else:
-                    use_gt = mx.random.uniform(shape=(B,)) < epsilon
-                    prev_hi = mx.where(use_gt, ht[:, step_t], pred_hi)
-                    prev_lo = mx.where(use_gt, lt[:, step_t], pred_lo)
+                    if epsilon >= 1.0:
+                        prev_hi = ht[:, step_t]
+                        prev_lo = lt[:, step_t]
+                    else:
+                        use_gt = torch.rand((B,), device=device) < epsilon
+                        prev_hi = torch.where(use_gt, ht[:, step_t], pred_hi)
+                        prev_lo = torch.where(use_gt, lt[:, step_t], pred_lo)
+        model.train()
         return min(correct_hi / total, correct_lo / total)
 
     print(f"  Training with scheduled sampling (ε: 1.0 → 0.1)")
 
     for step in range(steps):
         epsilon = linear_epsilon(step, steps)
-        idx = mx.array(np.random.choice(n, batch_size, replace=False))
-        loss, grads = nn.value_and_grad(model, loss_fn)(
-            model, Hm[idx], Sm[idx], Tm[idx], HTm[idx], LTm[idx], Mm[idx], epsilon)
-        optimizer.update(model, grads)
-        mx.eval(model.parameters(), optimizer.state)
+        lr = scheduler(step)
+        optimizer.param_groups[0]["lr"] = lr
+
+        idx = torch.tensor(
+            np.random.choice(n, batch_size, replace=False), device=device
+        )
+
+        model.zero_grad()
+        loss = loss_fn(
+            model, Hm[idx], Sm[idx], Tm[idx], HTm[idx], LTm[idx], Mm[idx], epsilon
+        )
+        loss.backward()
+        optimizer.step()
 
         if step % 250 == 0:
             tf_acc = eval_accuracy(1.0)
             inf_acc = eval_accuracy(0.0)
-            print(f"  step {step:5d}  ε={epsilon:.2f}  loss={loss.item():.4f}  "
-                  f"tf_acc={tf_acc:.1%}  inf_acc={inf_acc:.1%}")
+            print(
+                f"  step {step:5d}  ε={epsilon:.2f}  loss={loss.item():.4f}  "
+                f"tf_acc={tf_acc:.1%}  inf_acc={inf_acc:.1%}"
+            )
             if inf_acc >= 0.9999:
-                mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
+                torch.save(model.state_dict(), "weights.pth")
                 print(f"  Saved weights (inf_acc={inf_acc:.4%})")
             if inf_acc == 1.0:
                 perfect += 1
@@ -438,6 +474,7 @@ def train(H, T, S, HT, LT, M, max_steps, steps=80000):
             else:
                 perfect = 0
 
+    torch.save(model.state_dict(), "weights.pth")
     return model
 
 
@@ -449,10 +486,13 @@ N = "\033[0m"
 
 
 def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
     print(f"{B}Reflex — Training{N}\n")
     print(f"{D}Autoregressive control head + scheduled sampling{N}\n")
 
-    backbone, tokenizer = load_backbone()
+    backbone, tokenizer = load_backbone(device)
 
     print(f"\n{D}Generating tasks...{N}")
     tasks = generate_tasks()
@@ -460,18 +500,18 @@ def main():
 
     print(f"\n{D}Collecting sequences...{N}")
     t0 = time.time()
-    instr_cache = load_or_encode(tasks, backbone, tokenizer)
+    instr_cache = load_or_encode(tasks, backbone, tokenizer, device)
     print(f"  {len(instr_cache)} unique instructions")
     H, T, S, HT, LT, M, max_steps = collect_sequences(tasks, instr_cache)
-    print(f"  Collected in {time.time()-t0:.1f}s")
+    print(f"  Collected in {time.time() - t0:.1f}s")
 
     print(f"\n{D}Training...{N}")
     t0 = time.time()
-    model = train(H, T, S, HT, LT, M, max_steps, steps=80000)
-    print(f"  Trained in {time.time()-t0:.1f}s")
+    model = train(H, T, S, HT, LT, M, max_steps, steps=80000, device=device)
+    print(f"  Trained in {time.time() - t0:.1f}s")
 
-    mx.savez("weights.npz", **dict(tree_flatten(model.parameters())))
-    print(f"  Saved: weights.npz")
+    torch.save(model.state_dict(), "weights.pth")
+    print(f"  Saved: weights.pth")
     print(f"  Run: uv run demo")
 
 

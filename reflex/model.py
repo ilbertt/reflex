@@ -11,20 +11,21 @@ Flow:
 
 import logging
 
-import mlx.core as mx
-import mlx.nn as nn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from .chip8 import DISPLAY_SIZE
 
 BACKBONE_DIM = 1536
-BACKBONE_ID = "mlx-community/Qwen2.5-Coder-1.5B-Instruct-bf16"
+BACKBONE_ID = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
 STATE_DIM = DISPLAY_SIZE + 16 + 2 + 2  # 2068 (display + registers + I + prev_opcode)
 STATE_TOKENS = 32
-MAX_TOKENS = 20    # pad/truncate instruction token IDs
-TID_VOCAB = 4096   # hash embedding table size for token IDs
-TID_DIM = 64       # embedding dimension per token
+MAX_TOKENS = 20  # pad/truncate instruction token IDs
+TID_VOCAB = 4096  # hash embedding table size for token IDs
+TID_DIM = 64  # embedding dimension per token
 
 N_HIGH = 256
 N_LOW = 256
@@ -34,27 +35,46 @@ PREV_OP_DIM = 128
 PREV_HALF = PREV_OP_DIM // 2
 
 
-def load_backbone():
+def load_backbone(device="cuda"):
     logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-    from mlx_lm import load as mlx_load
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     print(f"  Loading backbone: {BACKBONE_ID}")
-    model, tokenizer = mlx_load(BACKBONE_ID)
-    model.freeze()
+    tokenizer = AutoTokenizer.from_pretrained(BACKBONE_ID, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        BACKBONE_ID,
+        dtype=torch.bfloat16,
+        device_map=device if device != "cpu" else None,
+        trust_remote_code=True,
+    )
+    if device == "cuda":
+        model = model.to(device)
+    model.eval()
+    model.requires_grad_(False)
     return model, tokenizer
 
 
-def encode_instruction(text: str, backbone, tokenizer):
+def encode_instruction(text: str, backbone, tokenizer, device="cuda"):
     """Returns (hidden_states [1, seq_len, 1536], token_ids [MAX_TOKENS] as ints)."""
-    tokens = tokenizer.encode(text)
-    hidden = backbone.model(mx.array([tokens]))
+    tokens = tokenizer.encode(text, return_tensors="pt")
+
+    with torch.no_grad():
+        if device != "cpu":
+            tokens = tokens.to(device)
+        outputs = backbone(tokens, output_hidden_states=True)
+        hidden = outputs.hidden_states[-1]  # Get last layer hidden states
+
     tid = np.zeros(MAX_TOKENS, dtype=np.int32)
-    for i, t in enumerate(tokens[:MAX_TOKENS]):
-        tid[i] = t % TID_VOCAB  # hash to embedding table size
-    return hidden.astype(mx.float32), tid
+    token_list = tokens[0].cpu().numpy()
+    for i, t in enumerate(token_list[:MAX_TOKENS]):
+        tid[i] = int(t % TID_VOCAB)  # hash to embedding table size
+
+    return hidden.float().to("cpu"), tid
 
 
 class GRUCell(nn.Module):
     """Gated Recurrent Unit — gives the control head autoregressive memory."""
+
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -62,12 +82,12 @@ class GRUCell(nn.Module):
         self.Wr = nn.Linear(input_dim + hidden_dim, hidden_dim)
         self.Wh = nn.Linear(input_dim + hidden_dim, hidden_dim)
 
-    def __call__(self, x, h):
-        xh = mx.concatenate([x, h], axis=-1)
-        z = mx.sigmoid(self.Wz(xh))
-        r = mx.sigmoid(self.Wr(xh))
-        xrh = mx.concatenate([x, r * h], axis=-1)
-        return (1 - z) * h + z * mx.tanh(self.Wh(xrh))
+    def forward(self, x, h):
+        xh = torch.cat([x, h], dim=-1)
+        z = torch.sigmoid(self.Wz(xh))
+        r = torch.sigmoid(self.Wr(xh))
+        xrh = torch.cat([x, r * h], dim=-1)
+        return (1 - z) * h + z * torch.tanh(self.Wh(xrh))
 
 
 class ReflexModel(nn.Module):
@@ -95,12 +115,13 @@ class ReflexModel(nn.Module):
 
     Output: (high_byte_logits, low_byte_logits, new_h_state)
     """
+
     def __init__(self, dim=512, n_heads=8):
         super().__init__()
         self.dim = dim
 
         # Instruction tokens → queries
-        self.instr_norm = nn.RMSNorm(BACKBONE_DIM)
+        self.instr_norm = nn.LayerNorm(BACKBONE_DIM)
         self.instr_proj = nn.Linear(BACKBONE_DIM, dim)
 
         # Token ID embeddings
@@ -111,15 +132,15 @@ class ReflexModel(nn.Module):
         self.state_proj = nn.Linear(STATE_DIM, STATE_TOKENS * dim)
 
         # Cross-attention
-        self.cross_attn = nn.MultiHeadAttention(dim, n_heads)
-        self.cross_norm = nn.RMSNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.cross_norm = nn.LayerNorm(dim)
 
         # Self-attention
-        self.self_attn = nn.MultiHeadAttention(dim, n_heads)
-        self.self_norm = nn.RMSNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.self_norm = nn.LayerNorm(dim)
 
         # Pool
-        self.out_norm = nn.RMSNorm(dim)
+        self.out_norm = nn.LayerNorm(dim)
 
         # Previous-opcode embeddings (one per byte)
         self.hi_embed = nn.Embedding(N_HIGH, PREV_HALF)
@@ -144,8 +165,15 @@ class ReflexModel(nn.Module):
         self.high_head = nn.Linear(dim, N_HIGH)
         self.low_head = nn.Linear(dim, N_LOW)
 
-    def __call__(self, backbone_hidden, state, token_ids,
-                 prev_hi=None, prev_lo=None, h_state=None):
+    def forward(
+        self,
+        backbone_hidden,
+        state,
+        token_ids,
+        prev_hi=None,
+        prev_lo=None,
+        h_state=None,
+    ):
         B = state.shape[0]
 
         # Instruction tokens → queries (with token-ID bias)
@@ -159,27 +187,27 @@ class ReflexModel(nn.Module):
 
         # Cross-attention (instruction looks at machine)
         h = self.cross_norm(q)
-        h = q + self.cross_attn(h, kv, kv)
+        h_attn, _ = self.cross_attn(h, kv, kv)
+        h = q + h_attn
 
         # Self-attention
         r = self.self_norm(h)
-        h = h + self.self_attn(r, r, r)
+        h_attn, _ = self.self_attn(r, r, r)
+        h = h + h_attn
 
         # Pool → context vector
-        ctx = self.out_norm(h).mean(axis=1)  # [B, dim]
+        ctx = self.out_norm(h).mean(dim=1)  # [B, dim]
 
         # Encode previous opcode (zeros at step 0)
         if prev_hi is None:
-            prev_hi = mx.zeros((B,), dtype=mx.int32)
-            prev_lo = mx.zeros((B,), dtype=mx.int32)
-        prev_embed = mx.concatenate(
-            [self.hi_embed(prev_hi), self.lo_embed(prev_lo)], axis=-1
-        )
+            prev_hi = torch.zeros((B,), dtype=torch.int32, device=state.device)
+            prev_lo = torch.zeros((B,), dtype=torch.int32, device=state.device)
+        prev_embed = torch.cat([self.hi_embed(prev_hi), self.lo_embed(prev_lo)], dim=-1)
 
         # GRU step
         if h_state is None:
-            h_state = mx.zeros((B, self.dim))
-        gru_input = mx.concatenate([ctx, prev_embed], axis=-1)
+            h_state = torch.zeros((B, self.dim), device=state.device)
+        gru_input = torch.cat([ctx, prev_embed], dim=-1)
         h_state = self.gru(gru_input, h_state)
 
         # Output (h_state + residual MLP + token-ID pathway)

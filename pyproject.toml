@@ -3,10 +3,11 @@ name = "reflex"
 version = "0.0.1"
 description = "A frozen LLM wired to a machine through cross-attention — no text generated"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
-    "mlx>=0.31.1",
-    "mlx-lm>=0.31.2",
+    "torch>=2.10.0",
+    "transformers>=4.46.0",
+    "accelerate>=1.0.0",
     "numpy>=2.0",
 ]
 

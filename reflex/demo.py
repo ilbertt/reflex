@@ -10,7 +10,7 @@ Usage:
 import sys
 import time
 
-import mlx.core as mx
+import torch
 import numpy as np
 
 from .chip8 import Chip8
@@ -45,51 +45,68 @@ def render_display(display: np.ndarray, width: int = 64, indent: str = "  ") -> 
     return "\n".join(lines)
 
 
-def run_instruction(chip, model, backbone, tokenizer, instruction, max_steps=20):
+def run_instruction(
+    chip, model, backbone, tokenizer, instruction, max_steps=20, device="cuda"
+):
     chip.reset()
 
-    h, tid = encode_instruction(instruction, backbone, tokenizer)
-    mx.eval(h)
+    h, tid = encode_instruction(instruction, backbone, tokenizer, device)
 
-    print(f"\n{B}━━━ \"{instruction}\" ━━━{N}\n")
+    print(f'\n{B}━━━ "{instruction}" ━━━{N}\n')
 
     total_us = 0
     h_state = None
     prev_hi = prev_lo = None
+
+    h_tensor = (
+        h.to(device)
+        if hasattr(h, "to")
+        else torch.tensor(h[None], dtype=torch.float32, device=device)
+    )
+    tid_tensor = torch.tensor(tid[None], dtype=torch.int32, device=device)
+
     for step in range(max_steps):
         state = chip.get_state()
+        state_tensor = torch.tensor(state[None], dtype=torch.float32, device=device)
 
         t0 = time.perf_counter()
-        hi_l, lo_l, h_state = model(
-            h, mx.array(state[None]), mx.array(tid[None]),
-            prev_hi, prev_lo, h_state,
-        )
-        mx.eval(hi_l, lo_l, h_state)
+        with torch.no_grad():
+            hi_l, lo_l, h_state = model(
+                h_tensor,
+                state_tensor,
+                tid_tensor,
+                prev_hi,
+                prev_lo,
+                h_state,
+            )
         us = (time.perf_counter() - t0) * 1e6
         total_us += us
 
-        hi = int(mx.argmax(hi_l[0]).item())
-        lo = int(mx.argmax(lo_l[0]).item())
+        hi = int(torch.argmax(hi_l[0]).item())
+        lo = int(torch.argmax(lo_l[0]).item())
         opcode = (hi << 8) | lo
 
         if opcode == 0x0000:
             print(f"  {D}step {step:2d}  STOP{N}  {D}({us:.0f}µs){N}")
             break
 
-        print(f"  {D}step {step:2d}{N}  opcode={Y}0x{opcode:04X}{N}  {D}({us:.0f}µs){N}")
+        print(
+            f"  {D}step {step:2d}{N}  opcode={Y}0x{opcode:04X}{N}  {D}({us:.0f}µs){N}"
+        )
         chip.step(opcode)
-        prev_hi = mx.array([hi], dtype=mx.int32)
-        prev_lo = mx.array([lo], dtype=mx.int32)
+        prev_hi = torch.tensor([hi], dtype=torch.int32, device=device)
+        prev_lo = torch.tensor([lo], dtype=torch.int32, device=device)
 
     pixels = int(chip.display.sum())
     if pixels > 0:
-        print(f"\n{G}Result ({pixels} pixels, {total_us/1000:.1f}ms total):{N}")
+        print(f"\n{G}Result ({pixels} pixels, {total_us / 1000:.1f}ms total):{N}")
         print(render_display(chip.display))
     else:
         print(f"\n  {R}No pixels drawn{N}")
 
 
 def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     interactive = "-i" in sys.argv or "--interactive" in sys.argv
 
     print(f"""
@@ -105,23 +122,32 @@ def main():
 """)
 
     print(f"{D}Loading...{N}")
-    backbone, tokenizer = load_backbone()
-    model = ReflexModel()
+    backbone, tokenizer = load_backbone(device)
+    model = ReflexModel().to(device)
+
     try:
-        model.load_weights(list(mx.load("weights.npz").items()))
+        model.load_state_dict(torch.load("weights.pth", map_location=device))
     except FileNotFoundError:
-        print("No weights.npz. Run: uv run train")
+        print("No weights.pth. Run: uv run train")
         return
 
     chip = Chip8()
 
     if interactive:
-        print(f"\n{D}Type an instruction. The model generates opcodes from understanding alone.{N}")
+        print(
+            f"\n{D}Type an instruction. The model generates opcodes from understanding alone.{N}"
+        )
         print(f"{D}Works best with these patterns:{N}")
-        print(f"{D}  Sprites:   draw a smiley    |  draw a heart    |  draw a circle{N}")
-        print(f"{D}             draw a star      |  draw a cross    |  draw a diamond{N}")
+        print(
+            f"{D}  Sprites:   draw a smiley    |  draw a heart    |  draw a circle{N}"
+        )
+        print(
+            f"{D}             draw a star      |  draw a cross    |  draw a diamond{N}"
+        )
         print(f"{D}             smiley           |  circle          |  a heart{N}")
-        print(f"{D}  Digits:    draw digit 7     |  draw digit A    |  digit 3 at 20 20{N}")
+        print(
+            f"{D}  Digits:    draw digit 7     |  draw digit A    |  digit 3 at 20 20{N}"
+        )
         print(f"{D}             draw digit 5 at position 30 15{N}")
         print(f"{D}             draw digits A and B{N}")
         print(f"{D}  Math:      3 + 5            |  add three and five{N}")
@@ -135,7 +161,9 @@ def main():
                 break
             if not instruction or instruction == "quit":
                 break
-            run_instruction(chip, model, backbone, tokenizer, instruction)
+            run_instruction(
+                chip, model, backbone, tokenizer, instruction, device=device
+            )
             print()
     else:
         for instruction in [
@@ -144,7 +172,9 @@ def main():
             "draw a circle",
             "draw digit 5 at position 30 15",
         ]:
-            run_instruction(chip, model, backbone, tokenizer, instruction)
+            run_instruction(
+                chip, model, backbone, tokenizer, instruction, device=device
+            )
 
     print(f"\n{D}Done.{N}")
 
