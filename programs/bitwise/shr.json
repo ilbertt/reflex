@@ -1,0 +1,1011 @@
+{
+  "family": "shr",
+  "programs": [
+    {
+      "instruction": "shift 255 right by 0",
+      "instruction_variants": [
+        "shift 255 right by 0",
+        "255 >> 0",
+        "right shift 255 by 0 bits",
+        "255 shifted right 0",
+        "compute 255 >> 0",
+        "shr(255, 0)",
+        "255 lsr 0"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 255
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 255 right by 1",
+      "instruction_variants": [
+        "shift 255 right by 1",
+        "255 >> 1",
+        "right shift 255 by 1 bits",
+        "255 shifted right 1",
+        "compute 255 >> 1",
+        "shr(255, 1)",
+        "255 lsr 1"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 127
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 255 right by 2",
+      "instruction_variants": [
+        "shift 255 right by 2",
+        "255 >> 2",
+        "right shift 255 by 2 bits",
+        "255 shifted right 2",
+        "compute 255 >> 2",
+        "shr(255, 2)",
+        "255 lsr 2"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 63
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 255 right by 3",
+      "instruction_variants": [
+        "shift 255 right by 3",
+        "255 >> 3",
+        "right shift 255 by 3 bits",
+        "255 shifted right 3",
+        "compute 255 >> 3",
+        "shr(255, 3)",
+        "255 lsr 3"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 31
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 255 right by 4",
+      "instruction_variants": [
+        "shift 255 right by 4",
+        "255 >> 4",
+        "right shift 255 by 4 bits",
+        "255 shifted right 4",
+        "compute 255 >> 4",
+        "shr(255, 4)",
+        "255 lsr 4"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        66,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 15
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 255 right by 5",
+      "instruction_variants": [
+        "shift 255 right by 5",
+        "255 >> 5",
+        "right shift 255 by 5 bits",
+        "255 shifted right 5",
+        "compute 255 >> 5",
+        "shr(255, 5)",
+        "255 lsr 5"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        82,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 7
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 255 right by 8",
+      "instruction_variants": [
+        "shift 255 right by 8",
+        "255 >> 8",
+        "right shift 255 by 8 bits",
+        "255 shifted right 8",
+        "compute 255 >> 8",
+        "shr(255, 8)",
+        "255 lsr 8"
+      ],
+      "bytes": [
+        147,
+        2,
+        240,
+        15,
+        19,
+        211,
+        130,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 0
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 65535 right by 0",
+      "instruction_variants": [
+        "shift 65535 right by 0",
+        "65535 >> 0",
+        "right shift 65535 by 0 bits",
+        "65535 shifted right 0",
+        "compute 65535 >> 0",
+        "shr(65535, 0)",
+        "65535 lsr 0"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 65535
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 65535 right by 1",
+      "instruction_variants": [
+        "shift 65535 right by 1",
+        "65535 >> 1",
+        "right shift 65535 by 1 bits",
+        "65535 shifted right 1",
+        "compute 65535 >> 1",
+        "shr(65535, 1)",
+        "65535 lsr 1"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 32767
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 65535 right by 2",
+      "instruction_variants": [
+        "shift 65535 right by 2",
+        "65535 >> 2",
+        "right shift 65535 by 2 bits",
+        "65535 shifted right 2",
+        "compute 65535 >> 2",
+        "shr(65535, 2)",
+        "65535 lsr 2"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 16383
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 65535 right by 3",
+      "instruction_variants": [
+        "shift 65535 right by 3",
+        "65535 >> 3",
+        "right shift 65535 by 3 bits",
+        "65535 shifted right 3",
+        "compute 65535 >> 3",
+        "shr(65535, 3)",
+        "65535 lsr 3"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 8191
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 65535 right by 4",
+      "instruction_variants": [
+        "shift 65535 right by 4",
+        "65535 >> 4",
+        "right shift 65535 by 4 bits",
+        "65535 shifted right 4",
+        "compute 65535 >> 4",
+        "shr(65535, 4)",
+        "65535 lsr 4"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        66,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 4095
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 65535 right by 5",
+      "instruction_variants": [
+        "shift 65535 right by 5",
+        "65535 >> 5",
+        "right shift 65535 by 5 bits",
+        "65535 shifted right 5",
+        "compute 65535 >> 5",
+        "shr(65535, 5)",
+        "65535 lsr 5"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        82,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 2047
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 65535 right by 8",
+      "instruction_variants": [
+        "shift 65535 right by 8",
+        "65535 >> 8",
+        "right shift 65535 by 8 bits",
+        "65535 shifted right 8",
+        "compute 65535 >> 8",
+        "shr(65535, 8)",
+        "65535 lsr 8"
+      ],
+      "bytes": [
+        183,
+        2,
+        1,
+        0,
+        147,
+        130,
+        242,
+        255,
+        19,
+        211,
+        130,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 255
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 0",
+      "instruction_variants": [
+        "shift 61680 right by 0",
+        "61680 >> 0",
+        "right shift 61680 by 0 bits",
+        "61680 shifted right 0",
+        "compute 61680 >> 0",
+        "shr(61680, 0)",
+        "61680 lsr 0"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 61680
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 1",
+      "instruction_variants": [
+        "shift 61680 right by 1",
+        "61680 >> 1",
+        "right shift 61680 by 1 bits",
+        "61680 shifted right 1",
+        "compute 61680 >> 1",
+        "shr(61680, 1)",
+        "61680 lsr 1"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 30840
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 2",
+      "instruction_variants": [
+        "shift 61680 right by 2",
+        "61680 >> 2",
+        "right shift 61680 by 2 bits",
+        "61680 shifted right 2",
+        "compute 61680 >> 2",
+        "shr(61680, 2)",
+        "61680 lsr 2"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 15420
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 3",
+      "instruction_variants": [
+        "shift 61680 right by 3",
+        "61680 >> 3",
+        "right shift 61680 by 3 bits",
+        "61680 shifted right 3",
+        "compute 61680 >> 3",
+        "shr(61680, 3)",
+        "61680 lsr 3"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 7710
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 4",
+      "instruction_variants": [
+        "shift 61680 right by 4",
+        "61680 >> 4",
+        "right shift 61680 by 4 bits",
+        "61680 shifted right 4",
+        "compute 61680 >> 4",
+        "shr(61680, 4)",
+        "61680 lsr 4"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        66,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 3855
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 5",
+      "instruction_variants": [
+        "shift 61680 right by 5",
+        "61680 >> 5",
+        "right shift 61680 by 5 bits",
+        "61680 shifted right 5",
+        "compute 61680 >> 5",
+        "shr(61680, 5)",
+        "61680 lsr 5"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        82,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 1927
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 61680 right by 8",
+      "instruction_variants": [
+        "shift 61680 right by 8",
+        "61680 >> 8",
+        "right shift 61680 by 8 bits",
+        "61680 shifted right 8",
+        "compute 61680 >> 8",
+        "shr(61680, 8)",
+        "61680 lsr 8"
+      ],
+      "bytes": [
+        183,
+        242,
+        0,
+        0,
+        147,
+        130,
+        2,
+        15,
+        19,
+        211,
+        130,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 240
+      },
+      "num_ops": 6
+    },
+    {
+      "instruction": "shift 100 right by 0",
+      "instruction_variants": [
+        "shift 100 right by 0",
+        "100 >> 0",
+        "right shift 100 by 0 bits",
+        "100 shifted right 0",
+        "compute 100 >> 0",
+        "shr(100, 0)",
+        "100 lsr 0"
+      ],
+      "bytes": [
+        147,
+        2,
+        64,
+        6,
+        19,
+        211,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 100
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 100 right by 1",
+      "instruction_variants": [
+        "shift 100 right by 1",
+        "100 >> 1",
+        "right shift 100 by 1 bits",
+        "100 shifted right 1",
+        "compute 100 >> 1",
+        "shr(100, 1)",
+        "100 lsr 1"
+      ],
+      "bytes": [
+        147,
+        2,
+        64,
+        6,
+        19,
+        211,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 50
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 100 right by 2",
+      "instruction_variants": [
+        "shift 100 right by 2",
+        "100 >> 2",
+        "right shift 100 by 2 bits",
+        "100 shifted right 2",
+        "compute 100 >> 2",
+        "shr(100, 2)",
+        "100 lsr 2"
+      ],
+      "bytes": [
+        147,
+        2,
+        64,
+        6,
+        19,
+        211,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 25
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 100 right by 3",
+      "instruction_variants": [
+        "shift 100 right by 3",
+        "100 >> 3",
+        "right shift 100 by 3 bits",
+        "100 shifted right 3",
+        "compute 100 >> 3",
+        "shr(100, 3)",
+        "100 lsr 3"
+      ],
+      "bytes": [
+        147,
+        2,
+        64,
+        6,
+        19,
+        211,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 12
+      },
+      "num_ops": 5
+    }
+  ]
+}
