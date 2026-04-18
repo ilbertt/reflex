@@ -1,9 +1,10 @@
-"""Combined 8-in-dist + 10-OOD eval with optional context-prefix toggle."""
+"""Combined 8-in-dist + 10-OOD eval."""
 import argparse
 import torch
 
 from reflex.demo import load, run_grounded
-from reflex.programs import DST_OFFSET, SRC_OFFSET
+from reflex.model import MAX_INSTR_TOKENS
+from reflex.programs import DST_OFFSET
 from reflex.riscv import DATA_BASE
 
 IN_DIST = [
@@ -31,12 +32,6 @@ OOD = [
 ]
 
 
-def run_one(model, tok, prompt, device, context_prefix, max_tok):
-    return run_grounded(model, tok, prompt, device, max_cycles=400,
-                        context_prefix=context_prefix,
-                        max_instr_tokens=max_tok)
-
-
 def check(cpu, kind, expected):
     if kind == 'mem':
         got = cpu.mem_word(DATA_BASE)
@@ -50,12 +45,13 @@ def check(cpu, kind, expected):
     return False, '?'
 
 
-def section(label, tasks, model, tok, device, context_prefix, max_tok):
+def section(label, tasks, model, tok, device, max_tok, use_chat, use_prefix):
     print(f'\n=== {label} ===')
     correct = 0
     for tag, prompt, kind, expected in tasks:
-        cpu, emitted, halted, err = run_one(
-            model, tok, prompt, device, context_prefix, max_tok)
+        cpu, emitted, halted, err = run_grounded(
+            model, tok, prompt, device, max_cycles=400, max_instr_tokens=max_tok,
+            use_chat_template=use_chat, use_context_prefix=use_prefix)
         ok, result = check(cpu, kind, expected)
         mark = '✓' if ok and halted and not err else '✗'
         tail = f'err={err}' if err else ''
@@ -69,25 +65,19 @@ def section(label, tasks, model, tok, device, context_prefix, max_tok):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--ckpt', required=True)
-    ap.add_argument('--context-prefix', action='store_true', default=False,
-                    help='Override: prepend context prefix at inference.')
-    ap.add_argument('--max-instr-tokens', type=int, default=None,
-                    help='Override tokenizer max length.')
     ap.add_argument('--device', default='cuda')
     args = ap.parse_args()
     device = args.device if (args.device == 'cpu' or torch.cuda.is_available()) else 'cpu'
     print(f'loading {args.ckpt}')
-    model, tok = load(args.ckpt, device)
-    ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
-    cfg = ckpt['config']
-    # If the checkpoint was trained with a prefix, auto-enable at inference.
-    cp = args.context_prefix or cfg.get('context_prefix', False)
-    mt = args.max_instr_tokens or cfg.get('max_instr_tokens', 32)
-    print(f'context_prefix={cp}  max_instr_tokens={mt}')
-    del ckpt
+    model, tok, cfg = load(args.ckpt, device)
+    mt = cfg.get('max_instr_tokens', MAX_INSTR_TOKENS)
+    use_chat = cfg.get('chat_template', True)
+    use_prefix = cfg.get('context_prefix', False)
+    print(f'chat_template={use_chat}  context_prefix={use_prefix}  '
+          f'max_instr_tokens={mt}')
 
-    n_in = section('IN-DIST', IN_DIST, model, tok, device, cp, mt)
-    n_ood = section('OOD', OOD, model, tok, device, cp, mt)
+    n_in = section('IN-DIST', IN_DIST, model, tok, device, mt, use_chat, use_prefix)
+    n_ood = section('OOD', OOD, model, tok, device, mt, use_chat, use_prefix)
     print(f'\nTOTAL: in-dist {n_in}/8  ood {n_ood}/10')
 
 

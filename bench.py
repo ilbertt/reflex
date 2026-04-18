@@ -4,19 +4,21 @@ import torch
 import numpy as np
 
 from reflex.demo import load
-from reflex.model import CONTEXT_PREFIX, code_region_halt_fill, extract_state
+from reflex.model import (
+    MAX_INSTR_TOKENS, code_region_halt_fill, extract_state, render_prompt,
+)
 from reflex.programs import SRC_OFFSET
 from reflex.riscv import DATA_BASE, PROGRAM_START, Rv32i
 
-ckpt_path = 'reflex_3b_ctx.pt'
+ckpt_path = 'reflex.pt'
 device = 'cuda'
-model, tok = load(ckpt_path, device)
-cfg = torch.load(ckpt_path, map_location='cpu', weights_only=False)['config']
-cp = cfg.get('context_prefix', False)
-mt = cfg.get('max_instr_tokens', 32)
+model, tok, cfg = load(ckpt_path, device)
+mt = cfg.get('max_instr_tokens', MAX_INSTR_TOKENS)
 
 prompt = 'say hi'
-text = (CONTEXT_PREFIX + prompt) if cp else prompt
+text = render_prompt(tok, prompt,
+                    use_chat_template=cfg.get('chat_template', True),
+                    use_context_prefix=cfg.get('context_prefix', False))
 e = tok(text, padding='max_length', truncation=True,
         max_length=mt, return_tensors='pt').to(device)
 ids, amask = e.input_ids, e.attention_mask

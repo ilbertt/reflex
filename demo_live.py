@@ -6,16 +6,15 @@ changes, we print the ASCII char that just appeared (or a hex byte if
 it's non-printable), so the user sees letters light up in order.
 """
 import argparse
-import sys
-import time
 
 import torch
 
 from reflex.demo import load
-from reflex.model import CONTEXT_PREFIX, MAX_INSTR_TOKENS, extract_state
+from reflex.model import (
+    MAX_INSTR_TOKENS, code_region_halt_fill, extract_state, render_prompt,
+)
 from reflex.programs import DISPLAY_BASE, SRC_OFFSET
 from reflex.riscv import DATA_BASE, HALT_INSTR, PROGRAM_START, Rv32i
-from reflex.model import code_region_halt_fill
 
 DISPLAY_WORDS = 32               # how many bytes to render
 
@@ -39,8 +38,11 @@ def render(buf: list[int]) -> str:
 
 @torch.no_grad()
 def run_live(model, tok, instruction, device, max_cycles=400,
-             context_prefix=True, max_instr_tokens=128, verbose=False):
-    text = (CONTEXT_PREFIX + instruction) if context_prefix else instruction
+             max_instr_tokens=MAX_INSTR_TOKENS, verbose=False,
+             use_chat_template=True, use_context_prefix=False):
+    text = render_prompt(tok, instruction,
+                         use_chat_template=use_chat_template,
+                         use_context_prefix=use_context_prefix)
     e = tok(text, padding='max_length', truncation=True,
             max_length=max_instr_tokens, return_tensors='pt').to(device)
     ids, amask = e.input_ids, e.attention_mask
@@ -106,13 +108,12 @@ def main():
     args = ap.parse_args()
     device = args.device if (args.device == 'cpu' or torch.cuda.is_available()) else 'cpu'
 
-    model, tok = load(args.ckpt, device)
-    ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
-    cfg = ckpt['config']
-    cp = cfg.get('context_prefix', False)
-    mt = cfg.get('max_instr_tokens', 32)
-    del ckpt
-    print(f'loaded.  context_prefix={cp}  max_instr_tokens={mt}\n')
+    model, tok, cfg = load(args.ckpt, device)
+    mt = cfg.get('max_instr_tokens', MAX_INSTR_TOKENS)
+    use_chat = cfg.get('chat_template', True)
+    use_prefix = cfg.get('context_prefix', False)
+    print(f'loaded.  chat_template={use_chat}  context_prefix={use_prefix}  '
+          f'max_instr_tokens={mt}\n')
 
     examples = [args.instruction] if args.instruction else [
         # Trained display prompts
@@ -128,8 +129,8 @@ def main():
     for ex in examples:
         print(f'▶ {ex!r}')
         run_live(model, tok, ex, device, max_cycles=args.max_cycles,
-                 context_prefix=cp, max_instr_tokens=mt,
-                 verbose=args.verbose)
+                 max_instr_tokens=mt, verbose=args.verbose,
+                 use_chat_template=use_chat, use_context_prefix=use_prefix)
         print()
 
 

@@ -7,18 +7,23 @@ pre-loaded. At each cycle we record the live state (before the step)
 and the ground-truth instruction at PC, then write that instruction and
 step. The translation cache is invalidated after every write.
 
-Training: because the previous emitted instruction is already visible
-to the model through the memory window in the state vector, there is
-no autoregressive head to unroll — we flatten the collected per-cycle
-(instruction, state, target) triples into a flat pool and train with
-uniform random mini-batches. The backbone is fully fine-tuned and the
-injected cross-attention adapters are trained from scratch.
+Training: the previous emitted instruction is already visible to the
+model through the memory window in the state vector, so there is no
+autoregressive head — we flatten the collected per-cycle (instruction,
+state, target) triples into a pool and train with uniform random
+mini-batches against the 32 independent instruction-bit heads. The
+backbone is frozen; only the state encoder, cross-attn adapters, and
+head train. Mixed bf16 autocast, AdamW8bit, adapter gradient
+checkpointing — tuned to fit Qwen3-8B on 32 GB.
 
 Usage:
     uv run train
+    uv run train --backbone-id Qwen/Qwen2.5-Coder-3B-Instruct
 """
 import argparse
+import hashlib
 import os
+import pickle
 import random
 import time
 
@@ -27,11 +32,10 @@ import torch
 import torch.nn.functional as F
 
 from .model import (
-    BACKBONE_ID, CONTEXT_PREFIX, FIELD_NAMES, INJECT_EVERY, MAX_INSTR_TOKENS,
-    N_INSTR_BITS, N_STATE_TOKENS, GroundedReflex, build_backbone,
-    code_region_halt_fill, extract_state, split_fields,
+    BACKBONE_ID, FIELD_NAMES, N_INSTR_BITS, GroundedReflex, build_backbone,
+    code_region_halt_fill, extract_state, render_prompt,
 )
-from .programs import SRC_OFFSET, generate_tasks
+from .programs import SRC_OFFSET, load_tasks
 from .riscv import DATA_BASE, HALT_INSTR, PROGRAM_START, Rv32i
 
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
@@ -39,13 +43,13 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 # ── Dataset ───────────────────────────────────────────────────────────
 def collect_state_sequences(tasks, max_cycles: int = 5000):
-    """For each (instr_text, program_bytes) step through Unicorn mirroring
-    the inference-time emit-and-write flow. Returns a list of
-    ``(instr_text, [(state[65], instr_word_at_pc), ...])``."""
+    """For each (family, instr_text, program_bytes) step through Unicorn
+    mirroring the inference-time emit-and-write flow. Returns a list of
+    ``(family, instr_text, [(state[65], instr_word_at_pc), ...])``."""
     sequences = []
     halt_fill = code_region_halt_fill()
     seed = b''.join(int(i).to_bytes(4, 'little') for i in range(1, 9))
-    for instr_text, prog in tasks:
+    for family, instr_text, prog in tasks:
         prog_map = {PROGRAM_START + i: int.from_bytes(prog[i:i+4], 'little')
                     for i in range(0, len(prog), 4)}
         cpu = Rv32i()
@@ -55,102 +59,130 @@ def collect_state_sequences(tasks, max_cycles: int = 5000):
         seq = []
         for _ in range(max_cycles):
             pc = cpu.pc
-            if pc not in prog_map:                  # walked off verified trace
+            if pc not in prog_map:
                 break
-            state = extract_state(cpu)              # BEFORE writing — matches inference
+            state = extract_state(cpu)
             instr_w = prog_map[pc]
             seq.append((state, instr_w))
             if instr_w == HALT_INSTR:
                 break
             cpu.uc.mem_write(pc, int(instr_w).to_bytes(4, 'little'))
-            cpu.uc.ctl_remove_cache(pc, pc + 4)     # invalidate stale TB
+            cpu.uc.ctl_remove_cache(pc, pc + 4)
             try:
                 cpu.step()
             except Exception:
                 break
-        sequences.append((instr_text, seq))
+        sequences.append((family, instr_text, seq))
     return sequences
 
 
 # ── Training ──────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--steps', type=int, default=30000)
+    ap.add_argument('--backbone-id', default=BACKBONE_ID)
+    ap.add_argument('--steps', type=int, default=7500)
     ap.add_argument('--batch', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-4)
-    ap.add_argument('--backbone-lr', type=float, default=2e-5)
-    ap.add_argument('--backbone-id', default=BACKBONE_ID)
-    ap.add_argument('--freeze-backbone', action='store_true', default=False)
-    ap.add_argument('--dtype', default='bf16', choices=('bf16', 'fp16'))
-    ap.add_argument('--grad-ckpt', action='store_true', default=False)
-    ap.add_argument('--ckpt', default='reflex_grounded.pt')
+    ap.add_argument('--ckpt', default='reflex.pt')
     ap.add_argument('--resume', default=None,
                     help='Load adapter/head weights from this checkpoint.')
-    ap.add_argument('--init-step', type=int, default=0,
-                    help='Pre-advance the cosine LR scheduler this many '
-                    'steps so the schedule continues smoothly from where a '
-                    'prior training run stopped (used with --resume).')
     ap.add_argument('--probe', default=None,
-                    help='Prompt to run end-to-end every eval tick '
-                    '(format: "prompt=expected_value", e.g. '
-                    '"subtract 10 from 25=15"). Logs the emitted answer.')
-    ap.add_argument('--context-prefix', action='store_true', default=False,
-                    help='Prepend the machine-context prefix to every prompt.')
-    ap.add_argument('--max-instr-tokens', type=int, default=MAX_INSTR_TOKENS,
-                    help='Tokenizer max_length for the prompt (bump when '
-                    'using --context-prefix).')
+                    help='Prompt to run end-to-end every eval tick. '
+                    'Format: "prompt=value" (checks mem[DATA_BASE]) or '
+                    '"prompt@0xADDR=value".')
+    ap.add_argument('--inject-every', type=int, default=6,
+                    help='Insert a cross-attention adapter every N backbone '
+                    'layers. Larger = fewer adapters = less memory.')
+    ap.add_argument('--adapter-mlp-ratio', type=int, default=2)
+    ap.add_argument('--max-instr-tokens', type=int, default=96)
+    ap.add_argument('--sample-pool', type=int, default=300_000,
+                    help='Subsample the flat cycle pool to this size, '
+                    'balanced across families. 0 disables.')
     args = ap.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dtype_map = {'bf16': torch.bfloat16, 'fp16': torch.float16}
-    dtype = (dtype_map[args.dtype] if device == 'cuda' else torch.float32)
+    dtype = torch.bfloat16 if device == 'cuda' else torch.float32
     torch.manual_seed(0); np.random.seed(0); random.seed(0)
-    print(f'device: {device}  dtype: {dtype}  '
-          f'backbone: {args.backbone_id}  '
-          f'freeze_backbone: {args.freeze_backbone}', flush=True)
+    print(f'device: {device}  dtype: {dtype}  backbone: {args.backbone_id}',
+          flush=True)
 
     backbone, tok, HIDDEN = build_backbone(args.backbone_id, dtype=dtype)
     backbone = backbone.to(device)
     print(f'backbone hidden={HIDDEN} layers={len(backbone.layers)}', flush=True)
 
     # ── Data ──
-    print('generating tasks...', flush=True)
-    tasks = generate_tasks()
-    print(f'{len(tasks)} tasks. stepping through Unicorn...', flush=True)
-    t0 = time.time()
-    seqs = collect_state_sequences(tasks)
-    seqs = [(t, s) for t, s in seqs if len(s) > 0]
-    print(f'collected state sequences in {time.time()-t0:.1f}s', flush=True)
-    lens = [len(s) for _, s in seqs]
+    print('loading tasks from JSON corpus...', flush=True)
+    tasks = load_tasks()
+    print(f'{len(tasks)} tasks.', flush=True)
+
+    # Deterministic cache of Unicorn-stepped state sequences.
+    cache_key = hashlib.sha256(
+        b''.join(f'{f}\0{t}\0'.encode() + b for f, t, b in tasks)
+    ).hexdigest()[:16]
+    cache_dir = os.path.join(os.path.dirname(__file__), '..', '.cache')
+    cache_path = os.path.join(cache_dir, f'state_seqs_{cache_key}.pkl')
+    if os.path.exists(cache_path):
+        t0 = time.time()
+        with open(cache_path, 'rb') as fh:
+            seqs = pickle.load(fh)
+        print(f'loaded cached state sequences ({len(seqs)}) from '
+              f'{cache_path} in {time.time()-t0:.1f}s', flush=True)
+    else:
+        print('stepping through Unicorn...', flush=True)
+        t0 = time.time()
+        seqs = collect_state_sequences(tasks)
+        seqs = [(f, t, s) for f, t, s in seqs if len(s) > 0]
+        print(f'collected state sequences in {time.time()-t0:.1f}s', flush=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, 'wb') as fh:
+            pickle.dump(seqs, fh)
+        print(f'cached to {cache_path}', flush=True)
+
+    lens = [len(s) for _, _, s in seqs]
     print(f'programs={len(seqs)}, step-count min/avg/max = '
           f'{min(lens)}/{sum(lens)/len(lens):.1f}/{max(lens)}', flush=True)
 
-    # Tokenize unique instructions once.
-    uniq_instrs = sorted({t for t, _ in seqs})
-    if args.context_prefix:
-        tok_inputs = [CONTEXT_PREFIX + s for s in uniq_instrs]
-        print(f'context_prefix: ON  max_instr_tokens={args.max_instr_tokens}',
-              flush=True)
-    else:
-        tok_inputs = uniq_instrs
+    # Tokenize unique instructions once using the backbone's chat template.
+    uniq_instrs = sorted({t for _, t, _ in seqs})
+    tok_inputs = [render_prompt(tok, s, use_chat_template=True)
+                  for s in uniq_instrs]
+    print(f'chat_template sample:\n    {tok_inputs[0][:200]!r}...', flush=True)
     enc = tok(tok_inputs, padding='max_length', truncation=True,
               max_length=args.max_instr_tokens, return_tensors='pt')
     instr_idx = {s: i for i, s in enumerate(uniq_instrs)}
 
-    # Flatten every (state, instr) cycle across all programs.
-    flat_instr = []
-    flat_state = []
-    flat_word = []
-    for txt, seq in seqs:
+    # Flatten every (state, instr) cycle, tagged with its program family.
+    flat_instr, flat_state, flat_word, flat_family = [], [], [], []
+    for fam, txt, seq in seqs:
         ii = instr_idx[txt]
         for st, w in seq:
             flat_instr.append(ii)
             flat_state.append(st.astype(np.int64))
             flat_word.append(int(w) & 0xFFFFFFFF)
-    N = len(flat_instr)
-    print(f'flat cycle-pool size = {N}', flush=True)
+            flat_family.append(fam)
+    N_full = len(flat_instr)
+    print(f'flat cycle-pool size = {N_full}', flush=True)
 
-    # Convert each 32-bit instruction to its bit vector [32] (LSB first).
+    if args.sample_pool and args.sample_pool < N_full:
+        import collections
+        by_fam = collections.defaultdict(list)
+        for i, f in enumerate(flat_family):
+            by_fam[f].append(i)
+        per_fam = max(1, args.sample_pool // len(by_fam))
+        rng = np.random.default_rng(0)
+        keep_idx = []
+        for f, idxs in by_fam.items():
+            take = min(len(idxs), per_fam)
+            keep_idx.extend(rng.choice(idxs, size=take, replace=False).tolist())
+        keep_idx = np.array(sorted(keep_idx), dtype=np.int64)
+        flat_instr = [flat_instr[i] for i in keep_idx]
+        flat_state = [flat_state[i] for i in keep_idx]
+        flat_word = [flat_word[i] for i in keep_idx]
+        print(f'balanced subsample: {len(by_fam)} families × {per_fam} each '
+              f'→ pool size = {len(flat_instr)}', flush=True)
+    N = len(flat_instr)
+
+    # 32-bit instruction → LSB-first bit vector.
     words = np.array(flat_word, dtype=np.uint32)
     bits = np.zeros((N, N_INSTR_BITS), dtype=np.float32)
     for i in range(N_INSTR_BITS):
@@ -158,109 +190,71 @@ def main():
 
     INSTR_IDX_d = torch.from_numpy(np.array(flat_instr, dtype=np.int64)).to(device)
     STATE_d = torch.from_numpy(np.stack(flat_state)).to(device)
-    BITS_d = torch.from_numpy(bits).to(device)                  # [N, 32]
-    WORD_d = torch.from_numpy(words.astype(np.int64)).to(device)  # [N]
+    BITS_d = torch.from_numpy(bits).to(device)
     INSTR_IDS_d = enc.input_ids.to(device)
     INSTR_MASK_d = enc.attention_mask.to(device)
 
     # ── Model ──
     model = GroundedReflex(backbone, HIDDEN,
-                           freeze_backbone=args.freeze_backbone).to(device)
-    if args.grad_ckpt and hasattr(backbone, 'gradient_checkpointing_enable'):
-        backbone.gradient_checkpointing_enable()
-        backbone.config.use_cache = False
-        print('gradient checkpointing enabled', flush=True)
-    if args.freeze_backbone:
-        backbone.eval()
+                           inject_every=args.inject_every,
+                           freeze_backbone=True,
+                           adapter_mlp_ratio=args.adapter_mlp_ratio).to(device)
+    backbone.eval()
+    model.adapter_checkpointing = True
 
     if args.resume:
-        # Load to CPU then let load_state_dict copy into the GPU model — keeps
-        # the checkpoint dict off GPU so it doesn't double the adapter
-        # memory footprint during training start-up.
         _ck = torch.load(args.resume, map_location='cpu', weights_only=False)
         missing, unexpected = model.load_state_dict(_ck['state'], strict=False)
         del _ck
         import gc; gc.collect()
         if device == 'cuda':
             torch.cuda.empty_cache()
-        # When resuming with a frozen backbone, all backbone keys are
-        # "missing" — we don't care, they come from the pretrained model.
         ne_missing = [m for m in missing if not m.startswith('backbone.')]
         print(f'resumed from {args.resume}; new-module missing={len(ne_missing)} '
               f'unexpected={len(unexpected)}', flush=True)
 
-    bb_params = [p for p in backbone.parameters() if p.requires_grad]
-    bb_ids = {id(p) for p in backbone.parameters()}
-    new_params = [p for p in model.parameters()
-                  if id(p) not in bb_ids and p.requires_grad]
-    n_bb_total = sum(p.numel() for p in backbone.parameters()) / 1e6
-    n_bb = sum(p.numel() for p in bb_params) / 1e6
+    new_params = [p for p in model.parameters() if p.requires_grad]
     n_new = sum(p.numel() for p in new_params) / 1e6
-    print(f'backbone total={n_bb_total:.1f}M  trainable={n_bb:.2f}M  '
-          f'new={n_new:.2f}M', flush=True)
+    print(f'trainable params: {n_new:.2f}M', flush=True)
 
-    groups = []
-    if bb_params:
-        groups.append({'params': bb_params, 'lr': args.backbone_lr})
-    groups.append({'params': new_params, 'lr': args.lr})
-    opt = torch.optim.AdamW(groups, weight_decay=0.01)
+    import bitsandbytes as bnb
+    opt = bnb.optim.AdamW8bit([{'params': new_params, 'lr': args.lr}],
+                              weight_decay=0.01)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.steps, eta_min=1e-6)
 
     def trainable_state_dict():
-        """State dict containing only parameters with requires_grad — omits
-        the frozen backbone so checkpoints stay small."""
         full = model.state_dict()
         keep = {n for n, p in model.named_parameters() if p.requires_grad}
-        # Include buffers (LayerNorm running stats etc.) that live outside
-        # the backbone — cheap and needed at load time.
         for n, _ in model.named_buffers():
             if not n.startswith('backbone.'):
                 keep.add(n)
         return {k: v for k, v in full.items()
                 if k in keep or not k.startswith('backbone.')}
-    # When resuming, T_max includes the steps that already happened so
-    # the cosine continues smoothly instead of restarting from peak LR.
-    sched_total = args.steps + args.init_step
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=sched_total, eta_min=1e-6)
-    for _ in range(args.init_step):
-        sched.step()
-    if args.init_step:
-        cur_lr = sched.get_last_lr()[0]
-        print(f'resumed LR schedule: step {args.init_step}/{sched_total} '
-              f'→ lr={cur_lr:.2e}', flush=True)
 
-    # Field bit slices used only for diagnostic per-field accuracy.
     FIELD_BIT_SLICES = (
-        (0, 7),    # opcode: bits [0..7)
-        (7, 12),   # rd:     bits [7..12)
-        (12, 15),  # funct3: bits [12..15)
-        (15, 20),  # rs1:    bits [15..20)
-        (20, 25),  # rs2:    bits [20..25)
-        (25, 32),  # funct7: bits [25..32)
+        (0, 7), (7, 12), (12, 15), (15, 20), (20, 25), (25, 32),
     )
 
     def run_batch(idx):
         B = len(idx)
         state = STATE_d[idx]
-        tgts = BITS_d[idx]                                # [B, 32]
-        words = WORD_d[idx]                               # [B]
+        tgts = BITS_d[idx]
         ii = INSTR_IDX_d[idx]
         ids = INSTR_IDS_d[ii]
         mask = INSTR_MASK_d[ii]
-        logits = model(ids, mask, state)                  # [B, 32]
-        loss = F.binary_cross_entropy_with_logits(logits, tgts)
-
-        pred_bits = (logits > 0).long()                   # [B, 32], 0/1
-        tgt_bits = tgts.long()
-        bit_ok = (pred_bits == tgt_bits)                  # [B, 32]
-        pfc = []
-        for lo, hi in FIELD_BIT_SLICES:
-            pfc.append(bit_ok[:, lo:hi].all(dim=1).float().sum().item())
+        with torch.autocast('cuda', dtype=torch.bfloat16,
+                            enabled=(device == 'cuda')):
+            logits = model(ids, mask, state)
+        loss = F.binary_cross_entropy_with_logits(logits.float(), tgts)
+        pred_bits = (logits > 0).long()
+        bit_ok = (pred_bits == tgts.long())
+        pfc = [bit_ok[:, lo:hi].all(dim=1).float().sum().item()
+               for lo, hi in FIELD_BIT_SLICES]
         fc = bit_ok.all(dim=1).float().sum().item()
         return loss, pfc, fc, B
 
-    # Optional end-to-end probe. Format: "prompt=value" (checks mem[DATA_BASE])
-    # or "prompt@0xADDR=value" (checks mem[ADDR]).
+    # Optional end-to-end probe. Format: "prompt=value" or "prompt@0xADDR=value".
     probe_prompt = probe_expected = probe_addr = None
     if args.probe:
         prompt_part, _, probe_expected = args.probe.rpartition('=')
@@ -272,14 +266,13 @@ def main():
             probe_prompt = prompt_part
             probe_addr = DATA_BASE
         from .demo import run_grounded as _probe_run
-        print(f'probe: {probe_prompt!r} expects mem[0x{probe_addr:x}]={probe_expected}',
-              flush=True)
+        print(f'probe: {probe_prompt!r} expects mem[0x{probe_addr:x}]='
+              f'{probe_expected}', flush=True)
 
     def do_probe():
         model.eval()
         cpu, emitted, halted, err = _probe_run(
             model, tok, probe_prompt, device, max_cycles=200,
-            context_prefix=args.context_prefix,
             max_instr_tokens=args.max_instr_tokens)
         got = cpu.mem_word(probe_addr)
         mark = '✓' if halted and not err and got == probe_expected else '✗'
@@ -296,8 +289,7 @@ def main():
         opt.zero_grad()
         loss, _, _, _ = run_batch(idx)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], 1.0)
+        torch.nn.utils.clip_grad_norm_(new_params, 1.0)
         opt.step(); sched.step()
 
         if step % 50 == 0:
@@ -309,7 +301,7 @@ def main():
                 _, pfc, fc, tot = run_batch(eidx)
             pf = [c / max(tot, 1) for c in pfc]
             inf = fc / max(tot, 1)
-            print(f'step {step + args.init_step:5d}  loss={loss.item():.4f}  inf={inf:.1%}  [' +
+            print(f'step {step:5d}  loss={loss.item():.4f}  inf={inf:.1%}  [' +
                   ' '.join(f"{n}:{a:.2f}" for n, a in zip(FIELD_NAMES, pf)) +
                   f']  {time.time()-t_start:.0f}s', flush=True)
             if probe_prompt is not None:
@@ -321,11 +313,11 @@ def main():
                     'config': {
                         'backbone_id': args.backbone_id,
                         'hidden': HIDDEN,
-                        'inject_every': INJECT_EVERY,
+                        'inject_every': args.inject_every,
+                        'adapter_mlp_ratio': args.adapter_mlp_ratio,
                         'max_instr_tokens': args.max_instr_tokens,
-                        'context_prefix': args.context_prefix,
-                        'dtype': args.dtype,
-                        'freeze_backbone': args.freeze_backbone,
+                        'chat_template': True,
+                        'context_prefix': False,
                     },
                 }, args.ckpt)
 
@@ -334,11 +326,9 @@ def main():
         'config': {
             'backbone_id': args.backbone_id,
             'hidden': HIDDEN,
-            'inject_every': INJECT_EVERY,
+            'inject_every': args.inject_every,
+            'adapter_mlp_ratio': args.adapter_mlp_ratio,
             'max_instr_tokens': args.max_instr_tokens,
-            'context_prefix': args.context_prefix,
-            'dtype': args.dtype,
-            'freeze_backbone': args.freeze_backbone,
         },
     }, args.ckpt.replace('.pt', '_final.pt'))
     print(f'done. best inf={best_inf:.1%}', flush=True)

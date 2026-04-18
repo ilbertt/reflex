@@ -19,14 +19,25 @@ import torch.nn as nn
 from .riscv import DATA_BASE, PROGRAM_START, Rv32i
 
 # ── Config ────────────────────────────────────────────────────────────
-BACKBONE_ID = 'Qwen/Qwen2.5-0.5B'
-MAX_INSTR_TOKENS = 32
-INJECT_EVERY = 4                # cross-attn every N backbone layers
+BACKBONE_ID = 'Qwen/Qwen3-8B'
+MAX_INSTR_TOKENS = 96
+INJECT_EVERY = 6                # cross-attn every N backbone layers
 
-# Optional machine-context prefix. When enabled via CLI, this string is
-# prepended to every instruction before tokenisation. Tests whether a
-# textual prior about the target machine helps the frozen backbone
-# route instructions into useful RV32I programs.
+# Machine-context system message, passed through the backbone's chat
+# template as `<|im_start|>system ... <|im_end|><|im_start|>user ...
+# <|im_end|><|im_start|>assistant`. Using the template (not a raw text
+# prefix) keeps us on the exact format the instruct-tuned backbone saw
+# during post-training.
+SYSTEM_MESSAGE = (
+    "You control a RV32I CPU. "
+    "Registers x5-x15 available. "
+    "Data: 0x5000. "
+    "Display: 0x6000 (ASCII, one word per char)."
+)
+
+# Legacy plain-text machine-context prefix — retained so checkpoints
+# trained with context_prefix=True (pre-chat-template runs, e.g.
+# reflex_3b_ctx.pt) still render the same way at inference.
 CONTEXT_PREFIX = (
     "You control a RV32I CPU. "
     "Registers x5-x15 available. "
@@ -34,12 +45,32 @@ CONTEXT_PREFIX = (
     "Task: "
 )
 
+
+def render_prompt(tok, task: str, use_chat_template: bool = True,
+                  use_context_prefix: bool = False) -> str:
+    """Format `task` for the backbone's tokenizer.
+
+    Default (current runs): chat template with SYSTEM_MESSAGE. Legacy
+    checkpoints trained with a plain-text prefix pass
+    ``use_chat_template=False, use_context_prefix=True``.
+    """
+    if use_chat_template:
+        msgs = [
+            {"role": "system", "content": SYSTEM_MESSAGE},
+            {"role": "user", "content": task},
+        ]
+        return tok.apply_chat_template(msgs, tokenize=False,
+                                       add_generation_prompt=True)
+    if use_context_prefix:
+        return CONTEXT_PREFIX + task
+    return task
+
+
 # Bit-level output: 32 independent sigmoid heads, one per instruction bit.
-# This sidesteps the RV32I field polysemy (e.g. rs2 = register on R-type
-# but imm[4:0] on I-type) that bottlenecks a field-decomposition head.
+# Sidesteps RV32I field polysemy (e.g. rs2 = register on R-type but
+# imm[4:0] on I-type) that bottlenecks a field-decomposition head.
 N_INSTR_BITS = 32
 FIELD_NAMES = ('opcode', 'rd', 'funct3', 'rs1', 'rs2', 'funct7')
-FIELD_CLASSES = (128, 32, 8, 32, 32, 128)
 
 # State token layout (65 tokens total)
 N_REGS = 32                     # tokens 0..31 = x0..x31
@@ -51,12 +82,6 @@ MEM_WINDOW_WORDS = 16
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
-def split_fields(w: int) -> tuple[int, int, int, int, int, int]:
-    """Split a 32-bit RV32I instruction into its six field groups."""
-    return (w & 0x7F, (w >> 7) & 0x1F, (w >> 12) & 0x7,
-            (w >> 15) & 0x1F, (w >> 20) & 0x1F, (w >> 25) & 0x7F)
-
-
 def _safe_read_words(cpu: Rv32i, center: int,
                      n_words: int = MEM_WINDOW_WORDS) -> list[int]:
     """Read n_words centered on `center`, zero-filling unmapped bytes."""
@@ -161,7 +186,8 @@ class GroundedReflex(nn.Module):
     """
     def __init__(self, backbone, hidden: int,
                  inject_every: int = INJECT_EVERY,
-                 freeze_backbone: bool = False):
+                 freeze_backbone: bool = False,
+                 adapter_mlp_ratio: int = 4):
         super().__init__()
         self.backbone = backbone
         self.hidden = hidden
@@ -178,7 +204,8 @@ class GroundedReflex(nn.Module):
         n = len(layers)
         self.inject_indices = list(range(inject_every - 1, n, inject_every))
         self.adapters = nn.ModuleList(
-            [CrossAttnAdapter(hidden) for _ in self.inject_indices])
+            [CrossAttnAdapter(hidden, mlp_ratio=adapter_mlp_ratio)
+             for _ in self.inject_indices])
 
         self.head_mlp = nn.Sequential(
             nn.Linear(hidden, hidden), nn.GELU(),
@@ -198,6 +225,8 @@ class GroundedReflex(nn.Module):
             return bb.model.layers
         raise RuntimeError('Cannot locate backbone decoder layers')
 
+    adapter_checkpointing: bool = False      # toggled externally
+
     def _register_hooks(self):
         layers = self._backbone_layers()
         for handle in self._hook_handles:
@@ -210,10 +239,14 @@ class GroundedReflex(nn.Module):
                     kv = owner._current_kv
                     if kv is None:
                         return output
+                    def _apply(h):
+                        if owner.adapter_checkpointing and owner.training:
+                            return torch.utils.checkpoint.checkpoint(
+                                adapter_ref, h, kv, use_reentrant=False)
+                        return adapter_ref(h, kv)
                     if isinstance(output, tuple):
-                        h = adapter_ref(output[0], kv)
-                        return (h,) + output[1:]
-                    return adapter_ref(output, kv)
+                        return (_apply(output[0]),) + output[1:]
+                    return _apply(output)
                 return hook
             self._hook_handles.append(
                 layers[idx].register_forward_hook(make_hook(adapter)))
@@ -231,7 +264,11 @@ class GroundedReflex(nn.Module):
                                 return_dict=True, use_cache=False)
         finally:
             self._current_kv = None
-        h = out.last_hidden_state.to(torch.float32)
+        # Keep hidden states in the head's parameter dtype so fp32/bf16
+        # adapter heads both work. BCE loss in train.py casts logits to
+        # fp32 before computing the loss for numerical stability.
+        head_dtype = next(self.head_mlp.parameters()).dtype
+        h = out.last_hidden_state.to(head_dtype)
         # Last-token pool: in a causal LLM the final real token has
         # attended to every preceding token, so it encodes the full
         # prompt (prefix + task) without the dilution that mean-pool
