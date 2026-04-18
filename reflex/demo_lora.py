@@ -1,9 +1,9 @@
 """
-Grounded RV32I demo (Flamingo-style fusion).
+Grounded RV32I demo.
 
-Fresh Rv32i (code region pre-filled with HALT). Each cycle:
-  read live state → model (instruction + state fused inside the
-  backbone) emits one 4-byte instr → write at pc → step.
+Encode instruction once. Fresh Rv32i (code region pre-filled with HALT).
+Each cycle:
+  read live state → model emits one 4-byte instr → write at pc → step.
 Stops on HALT (jal x0, 0) or ``--max-cycles``.
 
 Usage:
@@ -12,15 +12,16 @@ Usage:
 """
 import argparse
 import os
+import sys
 
 import torch
 
-from .model import (
-    CONTEXT_PREFIX, INJECT_EVERY, MAX_INSTR_TOKENS, N_INSTR_BITS,
-    GroundedReflex, build_backbone, code_region_halt_fill, extract_state,
+from .model_lora import (
+    BACKBONE_ID, CTRL_DIM, FIELD_CLASSES, MAX_INSTR_TOKENS, N_XATTN_LAYERS,
+    LoraReflex, build_backbone, code_region_halt_fill, extract_state,
 )
 from .programs import DST_OFFSET, SRC_OFFSET
-from .riscv import DATA_BASE, HALT_INSTR, PROGRAM_START, Rv32i
+from .riscv import DATA_BASE, HALT_INSTR, PROGRAM_START, Rv32i, compose
 
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
@@ -39,15 +40,13 @@ EXAMPLES = [
 def load(ckpt_path: str, device: str = 'cuda'):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt['config']
-    dtype_map = {'bf16': torch.bfloat16, 'fp16': torch.float16}
-    dtype = (dtype_map.get(cfg.get('dtype', 'bf16'), torch.bfloat16)
-             if device == 'cuda' else torch.float32)
-    bb, tok, hidden = build_backbone(cfg['backbone_id'], dtype=dtype)
+    use_lora = not cfg.get('freeze_backbone', True)
+    bb, tok, hidden = build_backbone(
+        cfg['backbone_id'], use_lora=use_lora, dtype=torch.float16)
     bb = bb.to(device)
-    model = GroundedReflex(
-        bb, cfg['hidden'],
-        inject_every=cfg.get('inject_every', INJECT_EVERY),
-        freeze_backbone=cfg.get('freeze_backbone', False)).to(device)
+    model = LoraReflex(
+        bb, cfg['hidden'], cfg['ctrl_dim'], cfg['n_xattn'],
+        cfg.get('freeze_backbone', True)).to(device)
     model.load_state_dict(ckpt['state'], strict=False)
     model.eval()
     return model, tok
@@ -56,14 +55,13 @@ def load(ckpt_path: str, device: str = 'cuda'):
 @torch.no_grad()
 def run_grounded(model, tok, instruction: str, device: str = 'cuda',
                  max_cycles: int = 200, seed_memcpy: bool = True,
-                 verbose: bool = False, context_prefix: bool = False,
-                 max_instr_tokens: int | None = None
-                 ) -> tuple[Rv32i, list[int], bool, str]:
-    text = (CONTEXT_PREFIX + instruction) if context_prefix else instruction
-    max_len = max_instr_tokens or MAX_INSTR_TOKENS
-    e = tok(text, padding='max_length', truncation=True,
-            max_length=max_len, return_tensors='pt').to(device)
+                 verbose: bool = False) -> tuple[Rv32i, list[int], bool, str]:
+    e = tok(instruction, padding='max_length', truncation=True,
+            max_length=MAX_INSTR_TOKENS, return_tensors='pt').to(device)
     ids, amask = e.input_ids, e.attention_mask
+    with torch.autocast('cuda', dtype=torch.float16,
+                        enabled=(device == 'cuda')):
+        instr_h = model.encode_instruction(ids, amask)
 
     cpu = Rv32i()
     cpu.uc.mem_write(PROGRAM_START, code_region_halt_fill())
@@ -72,17 +70,22 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
         cpu.uc.mem_write(DATA_BASE + SRC_OFFSET, seed)
 
     emitted: list[int] = []
+    h_state = torch.zeros(1, model.ctrl_dim, device=device)
+    prev_fields = [torch.zeros(1, dtype=torch.long, device=device)
+                   for _ in FIELD_CLASSES]
+
     halted = False
     err = ''
     for cycle in range(max_cycles):
         pc = cpu.pc
         state = extract_state(cpu)
         state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
-        logits = model(ids, amask, state_t)              # [1, 32]
-        bits = (logits > 0).long().squeeze(0).tolist()
-        instr_w = 0
-        for i, b in enumerate(bits):
-            instr_w |= (int(b) & 1) << i
+        with torch.autocast('cuda', dtype=torch.float16,
+                            enabled=(device == 'cuda')):
+            logits, h_state = model.decode_step(
+                instr_h, amask, state_t, prev_fields, h_state)
+        fields = [int(lg.argmax(-1).item()) for lg in logits]
+        instr_w = compose(*fields)
         emitted.append(instr_w)
         if verbose:
             print(f'  cyc {cycle:3d}  pc=0x{pc:04X}  {instr_w:08X}')
@@ -99,6 +102,9 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
             cpu.step()
         except Exception as e_:
             err = f'step at pc=0x{pc:X}: {e_}'; break
+
+        prev_fields = [torch.tensor([v], dtype=torch.long, device=device)
+                       for v in fields]
 
     return cpu, emitted, halted, err
 
