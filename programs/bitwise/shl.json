@@ -1,0 +1,955 @@
+{
+  "family": "shl",
+  "programs": [
+    {
+      "instruction": "shift 1 left by 0",
+      "instruction_variants": [
+        "shift 1 left by 0",
+        "1 << 0",
+        "left shift 1 by 0 bits",
+        "1 shifted left 0",
+        "compute 1 << 0",
+        "shl(1, 0)",
+        "1 lsl 0"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 1
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 1",
+      "instruction_variants": [
+        "shift 1 left by 1",
+        "1 << 1",
+        "left shift 1 by 1 bits",
+        "1 shifted left 1",
+        "compute 1 << 1",
+        "shl(1, 1)",
+        "1 lsl 1"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 2
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 2",
+      "instruction_variants": [
+        "shift 1 left by 2",
+        "1 << 2",
+        "left shift 1 by 2 bits",
+        "1 shifted left 2",
+        "compute 1 << 2",
+        "shl(1, 2)",
+        "1 lsl 2"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 4
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 3",
+      "instruction_variants": [
+        "shift 1 left by 3",
+        "1 << 3",
+        "left shift 1 by 3 bits",
+        "1 shifted left 3",
+        "compute 1 << 3",
+        "shl(1, 3)",
+        "1 lsl 3"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 8
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 4",
+      "instruction_variants": [
+        "shift 1 left by 4",
+        "1 << 4",
+        "left shift 1 by 4 bits",
+        "1 shifted left 4",
+        "compute 1 << 4",
+        "shl(1, 4)",
+        "1 lsl 4"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        66,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 16
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 5",
+      "instruction_variants": [
+        "shift 1 left by 5",
+        "1 << 5",
+        "left shift 1 by 5 bits",
+        "1 shifted left 5",
+        "compute 1 << 5",
+        "shl(1, 5)",
+        "1 lsl 5"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        82,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 32
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 8",
+      "instruction_variants": [
+        "shift 1 left by 8",
+        "1 << 8",
+        "left shift 1 by 8 bits",
+        "1 shifted left 8",
+        "compute 1 << 8",
+        "shl(1, 8)",
+        "1 lsl 8"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        130,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 256
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 1 left by 12",
+      "instruction_variants": [
+        "shift 1 left by 12",
+        "1 << 12",
+        "left shift 1 by 12 bits",
+        "1 shifted left 12",
+        "compute 1 << 12",
+        "shl(1, 12)",
+        "1 lsl 12"
+      ],
+      "bytes": [
+        147,
+        2,
+        16,
+        0,
+        19,
+        147,
+        194,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 4096
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 0",
+      "instruction_variants": [
+        "shift 2 left by 0",
+        "2 << 0",
+        "left shift 2 by 0 bits",
+        "2 shifted left 0",
+        "compute 2 << 0",
+        "shl(2, 0)",
+        "2 lsl 0"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 2
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 1",
+      "instruction_variants": [
+        "shift 2 left by 1",
+        "2 << 1",
+        "left shift 2 by 1 bits",
+        "2 shifted left 1",
+        "compute 2 << 1",
+        "shl(2, 1)",
+        "2 lsl 1"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 4
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 2",
+      "instruction_variants": [
+        "shift 2 left by 2",
+        "2 << 2",
+        "left shift 2 by 2 bits",
+        "2 shifted left 2",
+        "compute 2 << 2",
+        "shl(2, 2)",
+        "2 lsl 2"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 8
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 3",
+      "instruction_variants": [
+        "shift 2 left by 3",
+        "2 << 3",
+        "left shift 2 by 3 bits",
+        "2 shifted left 3",
+        "compute 2 << 3",
+        "shl(2, 3)",
+        "2 lsl 3"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 16
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 4",
+      "instruction_variants": [
+        "shift 2 left by 4",
+        "2 << 4",
+        "left shift 2 by 4 bits",
+        "2 shifted left 4",
+        "compute 2 << 4",
+        "shl(2, 4)",
+        "2 lsl 4"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        66,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 32
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 5",
+      "instruction_variants": [
+        "shift 2 left by 5",
+        "2 << 5",
+        "left shift 2 by 5 bits",
+        "2 shifted left 5",
+        "compute 2 << 5",
+        "shl(2, 5)",
+        "2 lsl 5"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        82,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 64
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 8",
+      "instruction_variants": [
+        "shift 2 left by 8",
+        "2 << 8",
+        "left shift 2 by 8 bits",
+        "2 shifted left 8",
+        "compute 2 << 8",
+        "shl(2, 8)",
+        "2 lsl 8"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        130,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 512
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 2 left by 12",
+      "instruction_variants": [
+        "shift 2 left by 12",
+        "2 << 12",
+        "left shift 2 by 12 bits",
+        "2 shifted left 12",
+        "compute 2 << 12",
+        "shl(2, 12)",
+        "2 lsl 12"
+      ],
+      "bytes": [
+        147,
+        2,
+        32,
+        0,
+        19,
+        147,
+        194,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 8192
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 0",
+      "instruction_variants": [
+        "shift 3 left by 0",
+        "3 << 0",
+        "left shift 3 by 0 bits",
+        "3 shifted left 0",
+        "compute 3 << 0",
+        "shl(3, 0)",
+        "3 lsl 0"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 3
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 1",
+      "instruction_variants": [
+        "shift 3 left by 1",
+        "3 << 1",
+        "left shift 3 by 1 bits",
+        "3 shifted left 1",
+        "compute 3 << 1",
+        "shl(3, 1)",
+        "3 lsl 1"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        18,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 6
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 2",
+      "instruction_variants": [
+        "shift 3 left by 2",
+        "3 << 2",
+        "left shift 3 by 2 bits",
+        "3 shifted left 2",
+        "compute 3 << 2",
+        "shl(3, 2)",
+        "3 lsl 2"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        34,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 12
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 3",
+      "instruction_variants": [
+        "shift 3 left by 3",
+        "3 << 3",
+        "left shift 3 by 3 bits",
+        "3 shifted left 3",
+        "compute 3 << 3",
+        "shl(3, 3)",
+        "3 lsl 3"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        50,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 24
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 4",
+      "instruction_variants": [
+        "shift 3 left by 4",
+        "3 << 4",
+        "left shift 3 by 4 bits",
+        "3 shifted left 4",
+        "compute 3 << 4",
+        "shl(3, 4)",
+        "3 lsl 4"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        66,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 48
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 5",
+      "instruction_variants": [
+        "shift 3 left by 5",
+        "3 << 5",
+        "left shift 3 by 5 bits",
+        "3 shifted left 5",
+        "compute 3 << 5",
+        "shl(3, 5)",
+        "3 lsl 5"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        82,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 96
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 8",
+      "instruction_variants": [
+        "shift 3 left by 8",
+        "3 << 8",
+        "left shift 3 by 8 bits",
+        "3 shifted left 8",
+        "compute 3 << 8",
+        "shl(3, 8)",
+        "3 lsl 8"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        130,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 768
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 3 left by 12",
+      "instruction_variants": [
+        "shift 3 left by 12",
+        "3 << 12",
+        "left shift 3 by 12 bits",
+        "3 shifted left 12",
+        "compute 3 << 12",
+        "shl(3, 12)",
+        "3 lsl 12"
+      ],
+      "bytes": [
+        147,
+        2,
+        48,
+        0,
+        19,
+        147,
+        194,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 12288
+      },
+      "num_ops": 5
+    },
+    {
+      "instruction": "shift 5 left by 0",
+      "instruction_variants": [
+        "shift 5 left by 0",
+        "5 << 0",
+        "left shift 5 by 0 bits",
+        "5 shifted left 0",
+        "compute 5 << 0",
+        "shl(5, 0)",
+        "5 lsl 0"
+      ],
+      "bytes": [
+        147,
+        2,
+        80,
+        0,
+        19,
+        147,
+        2,
+        0,
+        55,
+        85,
+        0,
+        0,
+        35,
+        32,
+        101,
+        0,
+        111,
+        0,
+        0,
+        0
+      ],
+      "expected_result": {
+        "mem_0x5000": 5
+      },
+      "num_ops": 5
+    }
+  ]
+}
