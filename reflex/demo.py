@@ -1,153 +1,145 @@
 """
-Demo: type an instruction, the model emits CHIP-8 opcodes to execute it.
-No pre-loaded programs — every opcode comes from the model's understanding.
+Grounded RV32I demo.
+
+Encode instruction once. Fresh Rv32i (code region pre-filled with HALT).
+Each cycle:
+  read live state → model emits one 4-byte instr → write at pc → step.
+Stops on HALT (jal x0, 0) or ``--max-cycles``.
 
 Usage:
-    uv run demo       # preset test cases
-    uv run demo -i    # interactive: type anything
+    uv run demo                                # 8 canonical examples
+    uv run demo --instruction "add 7 and 8 and store the result"
 """
-
+import argparse
+import os
 import sys
-import time
 
-import mlx.core as mx
-import numpy as np
+import torch
 
-from .chip8 import Chip8
-from .model import ReflexModel, encode_instruction, load_backbone
+from .model import (
+    BACKBONE_ID, CTRL_DIM, FIELD_CLASSES, MAX_INSTR_TOKENS, N_XATTN_LAYERS,
+    GroundedReflex, build_backbone, code_region_halt_fill, extract_state,
+)
+from .programs import DST_OFFSET, SRC_OFFSET
+from .riscv import DATA_BASE, HALT_INSTR, PROGRAM_START, Rv32i, compose
 
-B = "\033[1m"
-D = "\033[2m"
-G = "\033[32m"
-Y = "\033[33m"
-R = "\033[31m"
-N = "\033[0m"
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
-
-def render_display(display: np.ndarray, width: int = 64, indent: str = "  ") -> str:
-    lines = [indent + "┌" + "─" * width + "┐"]
-    for row in range(0, 32, 2):
-        line = indent + "│"
-        for col in range(width):
-            top = display[row * width + col]
-            bot = display[(row + 1) * width + col] if row + 1 < 32 else 0
-            if top and bot:
-                line += "█"
-            elif top:
-                line += "▀"
-            elif bot:
-                line += "▄"
-            else:
-                line += " "
-        line += "│"
-        lines.append(line)
-    lines.append(indent + "└" + "─" * width + "┘")
-    return "\n".join(lines)
+EXAMPLES = [
+    'add 7 and 8 and store the result',
+    'compute 5 factorial and store it',
+    'store the first 6 Fibonacci numbers',
+    'count down from 5 to 1 and store each value',
+    'compute 1 + 2 + ... + 10 and store the sum',
+    'find the max of 7 and 12 and store it',
+    'copy 4 words from source to destination',
+    'call a function that doubles 25 and store the result',
+]
 
 
-def run_instruction(chip, model, backbone, tokenizer, instruction, max_steps=20):
-    chip.reset()
+def load(ckpt_path: str, device: str = 'cuda'):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cfg = ckpt['config']
+    use_lora = not cfg.get('freeze_backbone', True)
+    bb, tok, hidden = build_backbone(
+        cfg['backbone_id'], use_lora=use_lora, dtype=torch.float16)
+    bb = bb.to(device)
+    model = GroundedReflex(
+        bb, cfg['hidden'], cfg['ctrl_dim'], cfg['n_xattn'],
+        cfg.get('freeze_backbone', True)).to(device)
+    model.load_state_dict(ckpt['state'], strict=False)
+    model.eval()
+    return model, tok
 
-    h, tid = encode_instruction(instruction, backbone, tokenizer)
-    mx.eval(h)
 
-    print(f"\n{B}━━━ \"{instruction}\" ━━━{N}\n")
+@torch.no_grad()
+def run_grounded(model, tok, instruction: str, device: str = 'cuda',
+                 max_cycles: int = 200, seed_memcpy: bool = True,
+                 verbose: bool = False) -> tuple[Rv32i, list[int], bool, str]:
+    e = tok(instruction, padding='max_length', truncation=True,
+            max_length=MAX_INSTR_TOKENS, return_tensors='pt').to(device)
+    ids, amask = e.input_ids, e.attention_mask
+    with torch.autocast('cuda', dtype=torch.float16,
+                        enabled=(device == 'cuda')):
+        instr_h = model.encode_instruction(ids, amask)
 
-    total_us = 0
-    h_state = None
-    prev_hi = prev_lo = None
-    for step in range(max_steps):
-        state = chip.get_state()
+    cpu = Rv32i()
+    cpu.uc.mem_write(PROGRAM_START, code_region_halt_fill())
+    if seed_memcpy:
+        seed = b''.join(int(i).to_bytes(4, 'little') for i in range(1, 9))
+        cpu.uc.mem_write(DATA_BASE + SRC_OFFSET, seed)
 
-        t0 = time.perf_counter()
-        hi_l, lo_l, h_state = model(
-            h, mx.array(state[None]), mx.array(tid[None]),
-            prev_hi, prev_lo, h_state,
-        )
-        mx.eval(hi_l, lo_l, h_state)
-        us = (time.perf_counter() - t0) * 1e6
-        total_us += us
+    emitted: list[int] = []
+    h_state = torch.zeros(1, model.ctrl_dim, device=device)
+    prev_fields = [torch.zeros(1, dtype=torch.long, device=device)
+                   for _ in FIELD_CLASSES]
 
-        hi = int(mx.argmax(hi_l[0]).item())
-        lo = int(mx.argmax(lo_l[0]).item())
-        opcode = (hi << 8) | lo
+    halted = False
+    err = ''
+    for cycle in range(max_cycles):
+        pc = cpu.pc
+        state = extract_state(cpu)
+        state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
+        with torch.autocast('cuda', dtype=torch.float16,
+                            enabled=(device == 'cuda')):
+            logits, h_state = model.decode_step(
+                instr_h, amask, state_t, prev_fields, h_state)
+        fields = [int(lg.argmax(-1).item()) for lg in logits]
+        instr_w = compose(*fields)
+        emitted.append(instr_w)
+        if verbose:
+            print(f'  cyc {cycle:3d}  pc=0x{pc:04X}  {instr_w:08X}')
+        try:
+            cpu.uc.mem_write(pc, int(instr_w & 0xFFFFFFFF).to_bytes(4, 'little'))
+            cpu.uc.ctl_remove_cache(pc, pc + 4)
+        except Exception as e_:
+            err = f'write at pc=0x{pc:X}: {e_}'; break
+        if instr_w == HALT_INSTR:
+            halted = True; break
+        if instr_w == 0:
+            err = f'emitted 0x0 at pc=0x{pc:X}'; break
+        try:
+            cpu.step()
+        except Exception as e_:
+            err = f'step at pc=0x{pc:X}: {e_}'; break
 
-        if opcode == 0x0000:
-            print(f"  {D}step {step:2d}  STOP{N}  {D}({us:.0f}µs){N}")
-            break
+        prev_fields = [torch.tensor([v], dtype=torch.long, device=device)
+                       for v in fields]
 
-        print(f"  {D}step {step:2d}{N}  opcode={Y}0x{opcode:04X}{N}  {D}({us:.0f}µs){N}")
-        chip.step(opcode)
-        prev_hi = mx.array([hi], dtype=mx.int32)
-        prev_lo = mx.array([lo], dtype=mx.int32)
-
-    pixels = int(chip.display.sum())
-    if pixels > 0:
-        print(f"\n{G}Result ({pixels} pixels, {total_us/1000:.1f}ms total):{N}")
-        print(render_display(chip.display))
-    else:
-        print(f"\n  {R}No pixels drawn{N}")
+    return cpu, emitted, halted, err
 
 
 def main():
-    interactive = "-i" in sys.argv or "--interactive" in sys.argv
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--ckpt', default='reflex_grounded.pt')
+    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--max-cycles', type=int, default=200)
+    ap.add_argument('--instruction', default=None)
+    ap.add_argument('--verbose', action='store_true')
+    args = ap.parse_args()
+    device = args.device if (args.device == 'cpu' or torch.cuda.is_available()) else 'cpu'
+    print(f'loading {args.ckpt} on {device}', flush=True)
+    model, tok = load(args.ckpt, device)
+    print('loaded.\n', flush=True)
 
-    print(f"""
-{B}╔════════════════════════════════════════════════════════════════╗
-║                                                                ║
-║  Reflex: LLM understands → control head generates opcodes      ║
-║                                                                ║
-║  No pre-loaded programs. Every opcode comes from the model.    ║
-║  The LLM backbone understands the instruction.                 ║
-║  The control head generates CHIP-8 opcodes to execute it.      ║
-║                                                                ║
-╚════════════════════════════════════════════════════════════════╝{N}
-""")
-
-    print(f"{D}Loading...{N}")
-    backbone, tokenizer = load_backbone()
-    model = ReflexModel()
-    try:
-        model.load_weights(list(mx.load("weights.npz").items()))
-    except FileNotFoundError:
-        print("No weights.npz. Run: uv run train")
-        return
-
-    chip = Chip8()
-
-    if interactive:
-        print(f"\n{D}Type an instruction. The model generates opcodes from understanding alone.{N}")
-        print(f"{D}Works best with these patterns:{N}")
-        print(f"{D}  Sprites:   draw a smiley    |  draw a heart    |  draw a circle{N}")
-        print(f"{D}             draw a star      |  draw a cross    |  draw a diamond{N}")
-        print(f"{D}             smiley           |  circle          |  a heart{N}")
-        print(f"{D}  Digits:    draw digit 7     |  draw digit A    |  digit 3 at 20 20{N}")
-        print(f"{D}             draw digit 5 at position 30 15{N}")
-        print(f"{D}             draw digits A and B{N}")
-        print(f"{D}  Math:      3 + 5            |  add three and five{N}")
-        print(f"{D}             compute 3 plus 5 and draw result{N}")
-        print(f"{D}Type 'quit' to exit.{N}\n")
-
-        while True:
-            try:
-                instruction = input(f"{B}> {N}").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not instruction or instruction == "quit":
-                break
-            run_instruction(chip, model, backbone, tokenizer, instruction)
-            print()
-    else:
-        for instruction in [
-            "draw a smiley",
-            "draw digit 7 at position 15 10",
-            "draw a circle",
-            "draw digit 5 at position 30 15",
-        ]:
-            run_instruction(chip, model, backbone, tokenizer, instruction)
-
-    print(f"\n{D}Done.{N}")
+    instrs = [args.instruction] if args.instruction else EXAMPLES
+    for ex in instrs:
+        cpu, emitted, halted, err = run_grounded(
+            model, tok, ex, device, args.max_cycles, verbose=args.verbose)
+        marker = '✓' if halted and not err else '✗'
+        status = f'halted={halted}' + (f' err={err}' if err else '')
+        print(f'{marker} {ex!r}  ops={len(emitted)}  {status}')
+        if args.verbose:
+            for i, w in enumerate(emitted):
+                print(f'   cyc {i:3d}  {w:08X}')
+        mem_data = [cpu.mem_word(DATA_BASE + 4*i) for i in range(8)]
+        print(f'   mem[DATA_BASE..+32] = {mem_data}')
+        dst_start = cpu.mem_word(DATA_BASE + DST_OFFSET)
+        if dst_start != 0:
+            dst = [cpu.mem_word(DATA_BASE + DST_OFFSET + 4*i) for i in range(8)]
+            print(f'   mem[DST..+32]       = {dst}')
+        print()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
