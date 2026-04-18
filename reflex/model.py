@@ -1,226 +1,222 @@
 """
-Reflex model: frozen LLM backbone + autoregressive control head.
+Reflex — grounded RV32I control head.
 
-RV32I variant: emits 32-bit instructions as six classification heads over
-the ISA's field decomposition (opcode, rd, funct3, rs1, rs2, funct7).
-Six heads instead of CHIP-8's two — the model learns the ISA structure
-directly.
+A small LLM (Qwen2.5-0.5B) encodes the human instruction once per task;
+the cached hidden states become the cross-attention queries. At every
+emission step the queries are re-attended against fresh K/V built from
+the live Rv32i state (32 registers + PC + a 16-word window around PC +
+a 16-word window around SP). A GRU carries autoregressive context
+across steps; six classification heads predict the RV32I field
+decomposition (opcode / rd / funct3 / rs1 / rs2 / funct7).
 
-Flow:
-  instruction → frozen LLM → hidden states (understanding, same every step)
-  previous-instruction history → K/V tokens (one per emitted instruction)
-  cross-attention: instruction queries instruction history
-  GRU: carries hidden state across steps, takes previous instruction fields as input
-  six output heads: opcode, rd, funct3, rs1, rs2, funct7
+The backbone can be frozen or fine-tuned with LoRA. State encoding,
+cross-attention decoder, and output heads are always fully trained.
 """
-
-import logging
-
-import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
+import torch
+import torch.nn as nn
 
-BACKBONE_DIM = 1536
-BACKBONE_ID = "mlx-community/Qwen2.5-Coder-1.5B-Instruct-bf16"
+from .riscv import DATA_BASE, PROGRAM_START, Rv32i
 
-MAX_TOKENS = 32    # pad/truncate instruction token IDs
-TID_VOCAB = 4096
-TID_DIM = 192
+# ── Config ────────────────────────────────────────────────────────────
+BACKBONE_ID = 'Qwen/Qwen2.5-0.5B'
+MAX_INSTR_TOKENS = 32
+N_XATTN_LAYERS = 4
+CTRL_DIM = 384
 
-# RV32I field class counts (what each head predicts).
-N_OPCODE = 128   # 7 bits
-N_RD     = 32    # 5 bits
-N_FUNCT3 = 8     # 3 bits
-N_RS1    = 32    # 5 bits
-N_RS2    = 32    # 5 bits
-N_FUNCT7 = 128   # 7 bits
-
-FIELD_NAMES = ("opcode", "rd", "funct3", "rs1", "rs2", "funct7")
+# RV32I field heads
+N_OPCODE, N_RD, N_FUNCT3, N_RS1, N_RS2, N_FUNCT7 = 128, 32, 8, 32, 32, 128
+FIELD_NAMES = ('opcode', 'rd', 'funct3', 'rs1', 'rs2', 'funct7')
 FIELD_CLASSES = (N_OPCODE, N_RD, N_FUNCT3, N_RS1, N_RS2, N_FUNCT7)
-
-# Per-field embedding dimensions — roughly proportional to bit-widths.
-# Summed: 32+16+16+16+16+32 = 128.
 FIELD_EMBED_DIMS = (32, 16, 16, 16, 16, 32)
-PREV_OP_DIM = sum(FIELD_EMBED_DIMS)  # 128
+PREV_OP_DIM = sum(FIELD_EMBED_DIMS)
 
-# Cross-attention K/V: one slot per emitted instruction + 1 start token.
-# Programs top out at ~16 ops in our dataset; 32 leaves plenty of headroom.
-MAX_KV_LEN = 32
-
-# History-field embedding dims (separate from the GRU-input embeddings so
-# the two pathways can specialise).
-HIST_FIELD_EMBED_DIMS = (32, 16, 16, 16, 16, 32)
-HIST_CONCAT_DIM = sum(HIST_FIELD_EMBED_DIMS)  # 128
-
-
-def load_backbone():
-    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-    from mlx_lm import load as mlx_load
-    print(f"  Loading backbone: {BACKBONE_ID}")
-    model, tokenizer = mlx_load(BACKBONE_ID)
-    model.freeze()
-    return model, tokenizer
+# State token layout (65 tokens total)
+N_REGS = 32                     # tokens 0..31 = x0..x31
+IDX_PC = 32                     # token 32     = pc
+IDX_MEM_PC = 33                 # tokens 33..48 = 16 words around pc
+IDX_MEM_SP = 49                 # tokens 49..64 = 16 words around sp
+N_STATE_TOKENS = 65
+MEM_WINDOW_WORDS = 16
 
 
-def encode_instruction(text: str, backbone, tokenizer):
-    """Returns (hidden_states [1, seq_len, 1536], token_ids [MAX_TOKENS] as ints)."""
-    tokens = tokenizer.encode(text)
-    hidden = backbone.model(mx.array([tokens]))
-    tid = np.zeros(MAX_TOKENS, dtype=np.int32)
-    for i, t in enumerate(tokens[:MAX_TOKENS]):
-        tid[i] = t % TID_VOCAB
-    return hidden.astype(mx.float32), tid
+# ── Helpers ───────────────────────────────────────────────────────────
+def split_fields(w: int) -> tuple[int, int, int, int, int, int]:
+    """Split a 32-bit RV32I instruction into its six field groups."""
+    return (w & 0x7F, (w >> 7) & 0x1F, (w >> 12) & 0x7,
+            (w >> 15) & 0x1F, (w >> 20) & 0x1F, (w >> 25) & 0x7F)
 
 
-class GRUCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.Wz = nn.Linear(input_dim + hidden_dim, hidden_dim)
-        self.Wr = nn.Linear(input_dim + hidden_dim, hidden_dim)
-        self.Wh = nn.Linear(input_dim + hidden_dim, hidden_dim)
-
-    def __call__(self, x, h):
-        xh = mx.concatenate([x, h], axis=-1)
-        z = mx.sigmoid(self.Wz(xh))
-        r = mx.sigmoid(self.Wr(xh))
-        xrh = mx.concatenate([x, r * h], axis=-1)
-        return (1 - z) * h + z * mx.tanh(self.Wh(xrh))
-
-
-def _split_fields(instr: mx.array) -> tuple[mx.array, ...]:
-    """Split a tensor of 32-bit instructions into (opcode, rd, funct3, rs1, rs2, funct7)."""
-    return (
-        instr & 0x7F,
-        (instr >> 7) & 0x1F,
-        (instr >> 12) & 0x7,
-        (instr >> 15) & 0x1F,
-        (instr >> 20) & 0x1F,
-        (instr >> 25) & 0x7F,
-    )
+def _safe_read_words(cpu: Rv32i, center: int,
+                     n_words: int = MEM_WINDOW_WORDS) -> list[int]:
+    """Read n_words centered on `center`, zero-filling unmapped bytes."""
+    half = (n_words // 2) * 4
+    base = (center - half) & ~3
+    out = [0] * n_words
+    try:
+        data = bytes(cpu.uc.mem_read(base, n_words * 4))
+        for i in range(n_words):
+            out[i] = int.from_bytes(data[i*4:(i+1)*4], 'little')
+    except Exception:
+        for i in range(n_words):
+            try:
+                data = bytes(cpu.uc.mem_read(base + i*4, 4))
+                out[i] = int.from_bytes(data, 'little')
+            except Exception:
+                out[i] = 0
+    return out
 
 
-class ReflexModel(nn.Module):
+def extract_state(cpu: Rv32i) -> np.ndarray:
+    """Returns a [65] uint32 state vector for the given Rv32i instance."""
+    regs = [cpu.reg(i) for i in range(N_REGS)]
+    pc = cpu.pc
+    sp = cpu.reg(2)                          # x2 = sp by ABI
+    mem_pc = _safe_read_words(cpu, pc)
+    mem_sp = _safe_read_words(cpu, sp)
+    return np.array(regs + [pc] + mem_pc + mem_sp, dtype=np.uint32)
+
+
+# ── Model ─────────────────────────────────────────────────────────────
+class StateEncoder(nn.Module):
+    """[B, 65] uint32 state → [B, 65, hidden] tokens.
+
+    Each token = role_embedding + value_projection. Value is encoded by
+    splitting the 32-bit word into 4 bytes; each byte has its own
+    256-vocab embedding, and the four are concatenated + projected.
     """
-    Autoregressive control head. Six classification heads for RV32I's six
-    field-position groupings (opcode / rd / funct3 / rs1 / rs2 / funct7).
-    For non-R-type instructions those bit positions carry immediate bits
-    instead — the model learns the mapping.
-
-    Pathways (unchanged from CHIP-8 build apart from the head count):
-      - Cross-attention over emitted-instruction history (K/V).
-      - Token-ID MLP for operand-precision detail.
-      - GRU with scheduled-sampling-friendly previous-instruction input.
-
-    Input (per step t):
-      - backbone_hidden: [B, seq_len, BACKBONE_DIM]
-      - prev_instrs: [B, MAX_KV_LEN] int32 — emitted-instruction history
-      - kv_valid_count: t + 1 (start token + t emitted)
-      - token_ids: [B, MAX_TOKENS]
-      - prev_fields: tuple of 6 [B] int32 arrays — last emitted instruction
-      - h_state: [B, dim] GRU hidden state
-
-    Output: (logits_per_field: tuple of 6, new_h_state)
-    """
-    def __init__(self, dim=512, n_heads=8):
+    def __init__(self, hidden: int, n_tokens: int = N_STATE_TOKENS,
+                 byte_dim: int = 32):
         super().__init__()
-        self.dim = dim
+        self.n_tokens = n_tokens
+        self.role_embed = nn.Embedding(n_tokens, hidden)
+        self.byte_embeds = nn.ModuleList(
+            [nn.Embedding(256, byte_dim) for _ in range(4)])
+        self.value_proj = nn.Linear(4 * byte_dim, hidden)
+        self.norm = nn.LayerNorm(hidden)
 
-        # Instruction hidden-states → queries
-        self.instr_norm = nn.RMSNorm(BACKBONE_DIM)
-        self.instr_proj = nn.Linear(BACKBONE_DIM, dim)
+    def forward(self, state_vals: torch.Tensor) -> torch.Tensor:
+        B, N = state_vals.shape
+        v = state_vals.to(torch.long)
+        byte_embs = [self.byte_embeds[i](((v >> (8 * i)) & 0xFF))
+                     for i in range(4)]
+        val_cat = torch.cat(byte_embs, dim=-1)           # [B, N, 4*byte_dim]
+        val = self.value_proj(val_cat)                   # [B, N, hidden]
+        roles = torch.arange(N, device=state_vals.device)[None].expand(B, N)
+        return self.norm(val + self.role_embed(roles))
 
-        # Token-ID pathway
-        self.tid_embed = nn.Embedding(TID_VOCAB, TID_DIM)
-        self.tid_proj = nn.Linear(MAX_TOKENS * TID_DIM, dim)
 
-        # History embeddings — one per field.
-        self.hist_embeds = [
-            nn.Embedding(cls, d)
-            for cls, d in zip(FIELD_CLASSES, HIST_FIELD_EMBED_DIMS)
-        ]
-        self.hist_proj = nn.Linear(HIST_CONCAT_DIM, dim)
-        self.hist_pos_embed = nn.Embedding(MAX_KV_LEN + 1, dim)
-        self.kv_start_embed = nn.Embedding(1, dim)
-
-        # Cross / self attention
-        self.cross_attn = nn.MultiHeadAttention(dim, n_heads)
-        self.cross_norm = nn.RMSNorm(dim)
-        self.self_attn = nn.MultiHeadAttention(dim, n_heads)
-        self.self_norm = nn.RMSNorm(dim)
-        self.out_norm = nn.RMSNorm(dim)
-
-        # Previous-instruction field embeddings (separate weights from history).
-        self.prev_embeds = [
-            nn.Embedding(cls, d)
-            for cls, d in zip(FIELD_CLASSES, FIELD_EMBED_DIMS)
-        ]
-
-        # GRU
-        self.gru = GRUCell(dim + PREV_OP_DIM, dim)
-
-        # Token-ID → output MLP
-        self.tid_out = nn.Sequential(
-            nn.Linear(MAX_TOKENS * TID_DIM, dim),
-            nn.ReLU(),
-            nn.Linear(dim, dim),
-        )
-
-        # Output MLP + six heads
+class XAttnBlock(nn.Module):
+    """Pre-norm cross-attention + feed-forward residual block."""
+    def __init__(self, dim: int, n_heads: int = 8, mlp_ratio: int = 4):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
+        self.norm_mlp = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 2),
-            nn.ReLU(),
-            nn.Linear(dim * 2, dim),
+            nn.Linear(dim, dim * mlp_ratio), nn.GELU(),
+            nn.Linear(dim * mlp_ratio, dim),
         )
-        self.heads = [nn.Linear(dim, cls) for cls in FIELD_CLASSES]
 
-    def _embed_history(self, prev_instrs: mx.array) -> mx.array:
-        """prev_instrs [B, MAX_KV_LEN] int32 → [B, MAX_KV_LEN, dim]."""
-        fields = _split_fields(prev_instrs)
-        parts = [emb(f) for emb, f in zip(self.hist_embeds, fields)]
-        concat = mx.concatenate(parts, axis=-1)           # [B, KV, HIST_CONCAT_DIM]
-        return self.hist_proj(concat)                     # [B, KV, dim]
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        qh = self.norm_q(q)
+        kh = self.norm_kv(kv)
+        a, _ = self.attn(qh, kh, kh, need_weights=False)
+        q = q + a
+        return q + self.mlp(self.norm_mlp(q))
 
-    def _build_kv(self, prev_instrs: mx.array, kv_valid_count: int) -> tuple[mx.array, mx.array]:
-        B = prev_instrs.shape[0]
-        hist = self._embed_history(prev_instrs)           # [B, MAX_KV_LEN, dim]
-        pos = self.hist_pos_embed(mx.arange(1, MAX_KV_LEN + 1))[None]
-        hist = hist + pos
-        start = self.kv_start_embed(mx.zeros((B, 1), dtype=mx.int32))
-        start = start + self.hist_pos_embed(mx.zeros((1,), dtype=mx.int32))[None]
-        kv = mx.concatenate([start, hist], axis=1)        # [B, MAX_KV_LEN+1, dim]
-        valid = mx.arange(MAX_KV_LEN + 1) < kv_valid_count
-        mask = mx.where(valid, mx.array(0.0), mx.array(-1e9))
-        mask = mask[None, None, None, :]
-        return kv, mask
 
-    def __call__(self, backbone_hidden, prev_instrs, kv_valid_count, token_ids,
-                 prev_fields=None, h_state=None):
-        B = backbone_hidden.shape[0]
+class GroundedReflex(nn.Module):
+    """Grounded RV32I control head.
 
-        q = self.instr_proj(self.instr_norm(backbone_hidden))
-        tid_embedded = self.tid_embed(token_ids).reshape(B, -1)
-        q = q + self.tid_proj(tid_embedded)[:, None, :]
+    Forward flow at a single emission step:
+        1. Cached instruction hidden [B, T, H] is used as Q.
+        2. State encoder turns live [B, 65] state into K/V [B, 65, H].
+        3. Stack of cross-attention blocks refines Q using K/V.
+        4. Mean-pool Q (masked by instruction attention_mask) → ctx.
+        5. GRU(ctx ⊕ previous-instruction embed) → h_state.
+        6. Six classification heads → field logits.
+    """
+    def __init__(self, backbone, hidden: int, ctrl_dim: int = CTRL_DIM,
+                 n_xattn: int = N_XATTN_LAYERS,
+                 freeze_backbone: bool = True):
+        super().__init__()
+        self.backbone = backbone
+        self.hidden = hidden
+        self.ctrl_dim = ctrl_dim
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad_(False)
 
-        kv, attn_mask = self._build_kv(prev_instrs, kv_valid_count)
-        h = self.cross_norm(q)
-        h = q + self.cross_attn(h, kv, kv, mask=attn_mask)
+        self.state_encoder = StateEncoder(hidden)
+        self.xattn_blocks = nn.ModuleList(
+            [XAttnBlock(hidden) for _ in range(n_xattn)])
 
-        r = self.self_norm(h)
-        h = h + self.self_attn(r, r, r)
+        self.pool_proj = nn.Linear(hidden, ctrl_dim)
+        self.prev_embeds = nn.ModuleList([
+            nn.Embedding(c, d) for c, d in zip(FIELD_CLASSES, FIELD_EMBED_DIMS)
+        ])
+        self.gru = nn.GRUCell(ctrl_dim + PREV_OP_DIM, ctrl_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(ctrl_dim, ctrl_dim * 2), nn.GELU(),
+            nn.Linear(ctrl_dim * 2, ctrl_dim),
+        )
+        self.heads = nn.ModuleList(
+            [nn.Linear(ctrl_dim, c) for c in FIELD_CLASSES])
 
-        ctx = self.out_norm(h).mean(axis=1)
+    def encode_instruction(self, input_ids, attention_mask) -> torch.Tensor:
+        """Once per task. Returns cached hidden [B, T, H] in fp32."""
+        ctx = torch.no_grad() if self.freeze_backbone else torch.enable_grad()
+        with ctx:
+            out = self.backbone(input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                output_hidden_states=False, return_dict=True,
+                                use_cache=False)
+        return out.last_hidden_state.to(torch.float32)
 
-        if prev_fields is None:
-            prev_fields = tuple(mx.zeros((B,), dtype=mx.int32) for _ in FIELD_CLASSES)
+    def decode_step(self, instr_hidden, instr_mask, state_vals,
+                    prev_fields, h_state):
+        kv = self.state_encoder(state_vals)              # [B, 65, H]
+        q = instr_hidden
+        for blk in self.xattn_blocks:
+            q = blk(q, kv)
+        m = instr_mask.unsqueeze(-1).float()
+        pooled = (q * m).sum(1) / m.sum(1).clamp_min(1.0)
+        ctx = self.pool_proj(pooled)
+
         prev_parts = [emb(f) for emb, f in zip(self.prev_embeds, prev_fields)]
-        prev_embed = mx.concatenate(prev_parts, axis=-1)
-
-        if h_state is None:
-            h_state = mx.zeros((B, self.dim))
-        gru_input = mx.concatenate([ctx, prev_embed], axis=-1)
-        h_state = self.gru(gru_input, h_state)
-
-        out = h_state + self.mlp(h_state) + self.tid_out(tid_embedded)
-        logits = tuple(head(out) for head in self.heads)
+        prev_emb = torch.cat(prev_parts, dim=-1)
+        h_state = self.gru(torch.cat([ctx, prev_emb], dim=-1), h_state)
+        out = h_state + self.mlp(h_state)
+        logits = [head(out) for head in self.heads]
         return logits, h_state
+
+
+def build_backbone(backbone_id: str = BACKBONE_ID,
+                   use_lora: bool = False,
+                   dtype: torch.dtype = torch.float16):
+    """Load a HuggingFace causal-LM backbone, optionally wrapped with LoRA."""
+    from transformers import AutoModel, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(backbone_id)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    bb = AutoModel.from_pretrained(backbone_id, torch_dtype=dtype)
+    if use_lora:
+        from peft import LoraConfig, get_peft_model
+        bb = get_peft_model(bb, LoraConfig(
+            r=8, lora_alpha=16, lora_dropout=0.05, bias='none',
+            target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']))
+    hidden = bb.config.hidden_size if not use_lora else bb.base_model.model.config.hidden_size
+    return bb, tok, hidden
+
+
+def code_region_halt_fill() -> bytes:
+    """Bytes to pre-fill the code region with HALT so Unicorn's pre-decode
+    never trips on a zero instruction and forward branches into un-emitted
+    space halt cleanly. Call ``cpu.uc.mem_write(PROGRAM_START, ...)`` with
+    the return value after constructing a fresh Rv32i."""
+    from .riscv import HALT_INSTR
+    code_size = DATA_BASE - PROGRAM_START
+    return HALT_INSTR.to_bytes(4, 'little') * (code_size // 4)

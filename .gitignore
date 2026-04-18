@@ -14,5 +14,6 @@ wheels/
 # Training artifacts (train locally with `uv run train`)
 *.npz
 *.pkl
+*.pt
 
 *.log

@@ -1,13 +1,16 @@
 [project]
 name = "reflex"
 version = "0.0.1"
-description = "A frozen LLM wired to a machine through cross-attention — no text generated"
+description = "Natural language → RV32I machine code, grounded in live machine state"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
-    "mlx>=0.31.1",
-    "mlx-lm>=0.31.2",
-    "numpy>=2.0",
+    "accelerate>=0.30",
+    "numpy>=1.26",
+    "peft>=0.12",
+    "torch>=2.3",
+    "transformers>=4.45",
+    "unicorn>=2.1",
 ]
 
 [project.scripts]
@@ -20,8 +23,3 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["reflex*"]
-
-[dependency-groups]
-dev = [
-    "unicorn>=2.1.4",
-]
