@@ -217,11 +217,13 @@ def reflex_worker(state: DemoState, model, tok, device, max_instr_tokens=96,
                 global_cyc += 1; break
             global_cyc += 1
 
-        # Stop refining if the model declared itself done immediately.
+        # Refinement only short-circuits when the model, looking at the
+        # final state at the start of a fresh pass, emits HALT on cycle
+        # 0 — "I inspected the state, there's nothing left to do."
+        # A halt at the end of pass N is NOT enough to stop: pass 1
+        # always runs; pass 2+ always gives the model a chance to either
+        # confirm "done" (first-op HALT) or append more code.
         if iter_halted_first:
-            break
-        # Or if the task result already landed.
-        if iter_halted and cpu.mem_word(DATA_BASE) != 0:
             break
 
     state.reflex_final_mem = cpu.mem_word(DATA_BASE)
@@ -497,19 +499,21 @@ def text_worker(state: DemoState, causal_lm, tok, device, max_new_tokens=256):
         enc = tok(text, return_tensors='pt').to(device)
         state.text_start = time.time()
         streamer = RichStreamer(tok, state)
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tok.pad_token_id,
+            streamer=streamer,
+        )
         if TEXT_STREAM is not None:
             with torch.cuda.stream(TEXT_STREAM):
-                causal_lm.generate(
-                    enc.input_ids, attention_mask=enc.attention_mask,
-                    max_new_tokens=max_new_tokens, do_sample=False,
-                    repetition_penalty=1.15,
-                    pad_token_id=tok.pad_token_id, streamer=streamer)
+                causal_lm.generate(enc.input_ids,
+                                   attention_mask=enc.attention_mask,
+                                   **gen_kwargs)
         else:
-            causal_lm.generate(
-                enc.input_ids, attention_mask=enc.attention_mask,
-                max_new_tokens=max_new_tokens, do_sample=False,
-                repetition_penalty=1.15,
-                pad_token_id=tok.pad_token_id, streamer=streamer)
+            causal_lm.generate(enc.input_ids,
+                               attention_mask=enc.attention_mask,
+                               **gen_kwargs)
 
         # ── Assemble the streamed program and execute in a fresh CPU. ──
         asm_text = state.text_out            # snapshot before annotation
