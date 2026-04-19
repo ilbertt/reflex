@@ -69,11 +69,11 @@ uv run demo --checkpoint reflex_coder7b.pt
 ## Installation
 
 ```bash
-git clone https://github.com/ilbert/reflex
+git clone https://github.com/ilbertt/reflex
 cd reflex
 uv sync
 # Download this checkpoint into the repo root:
-huggingface-cli download ilbert/reflex-coder7b-riscv reflex_coder7b.pt --local-dir .
+huggingface-cli download ilbertt/reflex-coder7b-riscv reflex_coder7b.pt --local-dir .
 ```
 
 The first time you run inference, HuggingFace will automatically fetch the frozen `Qwen2.5-Coder-7B-Instruct` backbone (~15 GB).
@@ -89,15 +89,3 @@ The first time you run inference, HuggingFace will automatically fetch the froze
 ## Files
 
 - `reflex_coder7b.pt` — adapter weights, state encoder, head, and config dict (backbone_id, hidden, inject_every, adapter_mlp_ratio, max_instr_tokens, chat_template, context_prefix).
-
-## Citation
-
-```bibtex
-@software{reflex2026,
-  title  = {Reflex: wiring a frozen LLM to a CPU through cross-attention},
-  author = {<your name>},
-  year   = {2026},
-  url    = {https://github.com/ilbert/reflex}
-}
-```
-
