@@ -109,6 +109,7 @@ class DemoState:
         self.text_display = ''
         self.text_halted = False
         self.text_ops_run = 0
+        self.text_regs = [0] * 32
 
 
 # Per-worker CUDA streams so the two threads can launch kernels
@@ -511,6 +512,7 @@ def text_worker(state: DemoState, causal_lm, tok, device, max_new_tokens=256):
             except Exception:
                 break
         state.text_final_mem = cpu.mem_word(DATA_BASE)
+        state.text_regs = [cpu.reg(i) for i in range(32)]
         state.text_display = ''.join(
             (chr(b & 0xff) if 32 <= (b & 0xff) < 127 else ('·' if b == 0 else '?'))
             for b in [cpu.mem_word(DISPLAY_BASE + 4*i) for i in range(32)]
@@ -533,13 +535,14 @@ def render_layout(state: DemoState) -> Layout:
         Layout(name='bottom', size=3),
     )
     layout['top'].split_row(Layout(name='left'), Layout(name='right'))
-    # Split the left panel vertically so the ops stream scrolls within a
-    # flex region while the register table / display / mem summary stay
-    # pinned at a fixed height below.
-    layout['left'].split_column(
-        Layout(name='left_ops'),                 # flex, fills remaining
-        Layout(name='left_info', size=14),       # fixed: 8 reg rows + 3 pad + display + mem
-    )
+    # Both columns split vertically: flex stream on top, fixed-height
+    # register table in the middle, and a dedicated display box below.
+    for side in ('left', 'right'):
+        layout[side].split_column(
+            Layout(name=f'{side}_ops'),           # flex
+            Layout(name=f'{side}_regs', size=12), # 8 reg rows + borders + pad
+            Layout(name=f'{side}_disp', size=5),  # display line + mem line
+        )
 
     # ── Header: current / most recent task ───────────────────────
     if state.prompt:
@@ -551,64 +554,68 @@ def render_layout(state: DemoState) -> Layout:
         header_body = Text('(no task yet — type one below)', style='dim')
     layout['header'].update(Panel(header_body, border_style='cyan'))
 
-    # ── Reflex panel ─────────────────────────────────────────────
-    # Keep the newest N ops that fit the flex region. Budget: total rows
-    # − header (3) − bottom (3) − info_area (14) − panel borders (~4).
+    # Helpers shared by both sides.
+    def reg_grid(regs):
+        t = Table.grid(padding=(0, 1))
+        for _ in range(4):
+            t.add_column(style='cyan', no_wrap=True)
+            t.add_column(no_wrap=True)
+        for row in range(8):
+            cells = []
+            for col in range(4):
+                r = row + col * 8
+                v = regs[r]
+                cells.append(f'x{r:<2d}')
+                cells.append(Text(f'0x{v:08x}',
+                                  style='bold white' if v else 'dim'))
+            t.add_row(*cells)
+        return t
+
+    def disp_panel(display, mem, border, halted=None, title='result'):
+        body = Group(
+            Text(f'display: [{display or "·"}]', style='bold yellow'),
+            Text(f'mem[0x5000] = 0x{mem:x} = {mem}'
+                 + (f'   halted={halted}' if halted is not None else ''),
+                 style='magenta'),
+        )
+        return Panel(body, title=title, border_style=border)
+
+    # ── Reflex (left) ────────────────────────────────────────────
+    # Keep the newest N ops that fit the flex region.
     total_rows = shutil.get_terminal_size((120, 40)).lines
-    ops_budget = max(5, total_rows - 3 - 3 - 14 - 4)
+    ops_budget = max(5, total_rows - 3 - 3 - 12 - 5 - 6)   # header/bot/regs/disp/borders
     op_lines = Text()
-    recent = list(state.reflex_ops)[-ops_budget:]
-    for cyc, pc, w, dis in recent:
-        if cyc < 0:                             # iteration-boundary marker
+    for cyc, pc, w, dis in list(state.reflex_ops)[-ops_budget:]:
+        if cyc < 0:
             op_lines.append(f'\n{dis}\n', style='bold yellow')
             continue
         op_lines.append(f'{cyc:3d}  0x{pc:04x}  {w:08x}  {dis}\n',
                         style='green' if state.reflex_halted else None)
 
-    # All 32 general-purpose registers, laid out 8 rows × 4 columns.
-    # Name in cyan; value in bold if nonzero so changes pop visually.
-    reg_tbl = Table.grid(padding=(0, 1))
-    for _ in range(4):
-        reg_tbl.add_column(style='cyan', no_wrap=True)
-        reg_tbl.add_column(no_wrap=True)
-    for row in range(8):
-        cells = []
-        for col in range(4):
-            r = row + col * 8
-            v = state.reflex_regs[r]
-            style = 'bold white' if v else 'dim'
-            cells.append(f'x{r:<2d}')
-            cells.append(Text(f'0x{v:08x}', style=style))
-        reg_tbl.add_row(*cells)
-
-    display_line = Text(f'display: [{state.reflex_display}]', style='yellow')
-    mem_line = Text(f'mem[0x5000]=0x{state.reflex_final_mem:x}={state.reflex_final_mem}',
-                    style='magenta')
-
     status = ('HALTED' if state.reflex_halted else
               ('RUNNING' if not state.reflex_done else 'STOPPED'))
-    iter_str = (f'iter {state.reflex_iter}/3' if state.reflex_total_iters > 1
-                or not state.reflex_done else '')
-    footer_parts = [f'{state.reflex_op_count} ops',
-                    f'{state.reflex_dt_ms} ms',
-                    '0 tokens generated']
-    if iter_str:
-        footer_parts.append(iter_str)
-    footer_parts.append(status)
-    footer = ' · '.join(footer_parts)
+    iter_str = (f'iter {state.reflex_iter}/3'
+                if state.reflex_total_iters > 1 or not state.reflex_done
+                else '')
+    parts = [f'{state.reflex_op_count} ops',
+             f'{state.reflex_dt_ms} ms',
+             '0 tokens']
+    if iter_str: parts.append(iter_str)
+    parts.append(status)
+    reflex_footer = ' · '.join(parts)
 
-    # Ops stream in a scrolling/flex region. The deque is cropped to
-    # roughly the visible rows so new ops push old ones off the top;
-    # rich clips any overflow at the panel boundary.
-    ops_panel = Panel(op_lines,
-                      title='[bold green]Reflex[/] — opcode stream',
-                      border_style='green')
-    info_panel = Panel(Group(reg_tbl, Text(), display_line, mem_line),
-                       border_style='green', subtitle=footer)
-    layout['left_ops'].update(ops_panel)
-    layout['left_info'].update(info_panel)
+    layout['left_ops'].update(Panel(
+        op_lines,
+        title='[bold green]Reflex[/] — opcode stream',
+        border_style='green', subtitle=reflex_footer))
+    layout['left_regs'].update(Panel(
+        reg_grid(state.reflex_regs),
+        title='registers', border_style='green'))
+    layout['left_disp'].update(disp_panel(
+        state.reflex_display, state.reflex_final_mem, 'green',
+        halted=state.reflex_halted))
 
-    # ── Text panel ───────────────────────────────────────────────
+    # ── Text mode (right) ────────────────────────────────────────
     if state.text_err:
         body_inner = Text(state.text_err, style='red')
         status_t = 'ERROR'
@@ -619,22 +626,18 @@ def render_layout(state: DemoState) -> Layout:
     else:
         body_inner = Text(state.text_out, style='white')
         status_t = 'DONE' if state.text_done else 'STREAMING'
-    if state.text_done and not state.text_err:
-        result_line = Text(
-            f'display: [{state.text_display or "·"}]',
-            style='yellow')
-        mem_line = Text(
-            f'mem[0x5000]=0x{state.text_final_mem:x}={state.text_final_mem}  '
-            f'halted={state.text_halted}',
-            style='magenta')
-        text_body = Group(body_inner, Text(), result_line, mem_line)
-    else:
-        text_body = body_inner
-    footer_t = (f'~{int(state.text_tok_count)} tokens · '
-                f'{state.text_dt_ms} ms · {state.text_ops_run} ops · {status_t}')
-    layout['right'].update(Panel(text_body,
-                                 title='[bold blue]Text mode[/] — writes asm → assembled → run in Unicorn',
-                                 border_style='blue', subtitle=footer_t))
+    text_footer = (f'~{int(state.text_tok_count)} tokens · '
+                   f'{state.text_dt_ms} ms · {state.text_ops_run} ops · {status_t}')
+    layout['right_ops'].update(Panel(
+        body_inner,
+        title='[bold blue]Text mode[/] — writes asm → assembled → run in Unicorn',
+        border_style='blue', subtitle=text_footer))
+    layout['right_regs'].update(Panel(
+        reg_grid(state.text_regs),
+        title='registers', border_style='blue'))
+    layout['right_disp'].update(disp_panel(
+        state.text_display, state.text_final_mem, 'blue',
+        halted=state.text_halted if state.text_done else None))
 
     # ── Bottom ───────────────────────────────────────────────────
     if state.phase == 'input':
@@ -711,6 +714,7 @@ def reset_for_run(state: DemoState) -> None:
     state.text_start = None; state.text_done = False; state.text_err = ''
     state.text_final_mem = 0; state.text_display = ''
     state.text_halted = False; state.text_ops_run = 0
+    state.text_regs = [0] * 32
     # Flush prior CUDA state so one run's allocations can't poison the next.
     if torch.cuda.is_available():
         torch.cuda.synchronize()
