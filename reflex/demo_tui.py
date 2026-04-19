@@ -111,8 +111,13 @@ class DemoState:
         self.text_ops_run = 0
 
 
+# Per-worker CUDA streams so the two threads can launch kernels
+# concurrently without colliding on the default cuBLAS workspace.
+REFLEX_STREAM = torch.cuda.Stream() if torch.cuda.is_available() else None
+TEXT_STREAM = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+
 # ── Reflex worker ─────────────────────────────────────────────────────
-GPU_LOCK = threading.Lock()
 
 
 @torch.no_grad()
@@ -166,9 +171,13 @@ def reflex_worker(state: DemoState, model, tok, device, max_instr_tokens=96,
             pc = cpu.pc
             st = extract_state(cpu)
             st_t = torch.from_numpy(st.astype('int64')).unsqueeze(0).to(device)
-            with GPU_LOCK:
+            if REFLEX_STREAM is not None:
+                with torch.cuda.stream(REFLEX_STREAM):
+                    logits = model(ids, amask, st_t)
+                REFLEX_STREAM.synchronize()       # needed before CPU reads
+            else:
                 logits = model(ids, amask, st_t)
-                bits = (logits > 0).long().squeeze(0).tolist()
+            bits = (logits > 0).long().squeeze(0).tolist()
             w = 0
             for i, b in enumerate(bits):
                 w |= (int(b) & 1) << i
@@ -458,7 +467,14 @@ def text_worker(state: DemoState, causal_lm, tok, device, max_new_tokens=256):
         enc = tok(text, return_tensors='pt').to(device)
         state.text_start = time.time()
         streamer = RichStreamer(tok, state, target_tps=30)
-        with GPU_LOCK:
+        if TEXT_STREAM is not None:
+            with torch.cuda.stream(TEXT_STREAM):
+                causal_lm.generate(
+                    enc.input_ids, attention_mask=enc.attention_mask,
+                    max_new_tokens=max_new_tokens, do_sample=False,
+                    repetition_penalty=1.15,
+                    pad_token_id=tok.pad_token_id, streamer=streamer)
+        else:
             causal_lm.generate(
                 enc.input_ids, attention_mask=enc.attention_mask,
                 max_new_tokens=max_new_tokens, do_sample=False,
