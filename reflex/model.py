@@ -1,16 +1,16 @@
 """
-Reflex — grounded RV32I control head.
+Reflex — grounded RV32I control head (Flamingo-style fusion).
 
-A small LLM (Qwen2.5-0.5B) encodes the human instruction once per task;
-the cached hidden states become the cross-attention queries. At every
-emission step the queries are re-attended against fresh K/V built from
-the live Rv32i state (32 registers + PC + a 16-word window around PC +
-a 16-word window around SP). A GRU carries autoregressive context
-across steps; six classification heads predict the RV32I field
+The backbone is fully unfrozen and processes the instruction tokens.
+Every ``INJECT_EVERY`` transformer layers, a cross-attention adapter is
+spliced in via a forward hook: the backbone's current hidden states
+(queries) attend over live machine-state K/V (32 regs + pc + 16-word
+window around pc + 16-word window around sp = 65 tokens). By the time
+control reaches the final layer, the instruction representation has
+been fused with the machine state at multiple depths.
+
+A small pooled-MLP + six classification heads then emit the RV32I field
 decomposition (opcode / rd / funct3 / rs1 / rs2 / funct7).
-
-The backbone can be frozen or fine-tuned with LoRA. State encoding,
-cross-attention decoder, and output heads are always fully trained.
 """
 import numpy as np
 import torch
@@ -19,17 +19,58 @@ import torch.nn as nn
 from .riscv import DATA_BASE, PROGRAM_START, Rv32i
 
 # ── Config ────────────────────────────────────────────────────────────
-BACKBONE_ID = 'Qwen/Qwen2.5-0.5B'
-MAX_INSTR_TOKENS = 32
-N_XATTN_LAYERS = 4
-CTRL_DIM = 384
+BACKBONE_ID = 'Qwen/Qwen2.5-Coder-7B-Instruct'
+MAX_INSTR_TOKENS = 96
+INJECT_EVERY = 4                # cross-attn every N backbone layers → 7 adapters on 28-layer Coder-7B
 
-# RV32I field heads
-N_OPCODE, N_RD, N_FUNCT3, N_RS1, N_RS2, N_FUNCT7 = 128, 32, 8, 32, 32, 128
+# Machine-context system message, passed through the backbone's chat
+# template as `<|im_start|>system ... <|im_end|><|im_start|>user ...
+# <|im_end|><|im_start|>assistant`. Using the template (not a raw text
+# prefix) keeps us on the exact format the instruct-tuned backbone saw
+# during post-training.
+SYSTEM_MESSAGE = (
+    "You control a RV32I CPU. "
+    "Registers x5-x15 available. "
+    "Data: 0x5000. "
+    "Display: 0x6000 (ASCII, one word per char)."
+)
+
+# Legacy plain-text machine-context prefix — retained so checkpoints
+# trained with context_prefix=True (pre-chat-template runs, e.g.
+# reflex_3b_ctx.pt) still render the same way at inference.
+CONTEXT_PREFIX = (
+    "You control a RV32I CPU. "
+    "Registers x5-x15 available. "
+    "Data: 0x5000. Display: 0x6000 (ASCII, one word per char). "
+    "Task: "
+)
+
+
+def render_prompt(tok, task: str, use_chat_template: bool = True,
+                  use_context_prefix: bool = False) -> str:
+    """Format `task` for the backbone's tokenizer.
+
+    Default (current runs): chat template with SYSTEM_MESSAGE. Legacy
+    checkpoints trained with a plain-text prefix pass
+    ``use_chat_template=False, use_context_prefix=True``.
+    """
+    if use_chat_template:
+        msgs = [
+            {"role": "system", "content": SYSTEM_MESSAGE},
+            {"role": "user", "content": task},
+        ]
+        return tok.apply_chat_template(msgs, tokenize=False,
+                                       add_generation_prompt=True)
+    if use_context_prefix:
+        return CONTEXT_PREFIX + task
+    return task
+
+
+# Bit-level output: 32 independent sigmoid heads, one per instruction bit.
+# Sidesteps RV32I field polysemy (e.g. rs2 = register on R-type but
+# imm[4:0] on I-type) that bottlenecks a field-decomposition head.
+N_INSTR_BITS = 32
 FIELD_NAMES = ('opcode', 'rd', 'funct3', 'rs1', 'rs2', 'funct7')
-FIELD_CLASSES = (N_OPCODE, N_RD, N_FUNCT3, N_RS1, N_RS2, N_FUNCT7)
-FIELD_EMBED_DIMS = (32, 16, 16, 16, 16, 32)
-PREV_OP_DIM = sum(FIELD_EMBED_DIMS)
 
 # State token layout (65 tokens total)
 N_REGS = 32                     # tokens 0..31 = x0..x31
@@ -41,12 +82,6 @@ MEM_WINDOW_WORDS = 16
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
-def split_fields(w: int) -> tuple[int, int, int, int, int, int]:
-    """Split a 32-bit RV32I instruction into its six field groups."""
-    return (w & 0x7F, (w >> 7) & 0x1F, (w >> 12) & 0x7,
-            (w >> 15) & 0x1F, (w >> 20) & 0x1F, (w >> 25) & 0x7F)
-
-
 def _safe_read_words(cpu: Rv32i, center: int,
                      n_words: int = MEM_WINDOW_WORDS) -> list[int]:
     """Read n_words centered on `center`, zero-filling unmapped bytes."""
@@ -77,7 +112,7 @@ def extract_state(cpu: Rv32i) -> np.ndarray:
     return np.array(regs + [pc] + mem_pc + mem_sp, dtype=np.uint32)
 
 
-# ── Model ─────────────────────────────────────────────────────────────
+# ── Modules ───────────────────────────────────────────────────────────
 class StateEncoder(nn.Module):
     """[B, 65] uint32 state → [B, 65, hidden] tokens.
 
@@ -106,109 +141,155 @@ class StateEncoder(nn.Module):
         return self.norm(val + self.role_embed(roles))
 
 
-class XAttnBlock(nn.Module):
-    """Pre-norm cross-attention + feed-forward residual block."""
+class CrossAttnAdapter(nn.Module):
+    """Flamingo-style gated cross-attention + FFN, spliced into a backbone
+    layer via a forward hook. Tanh gates are initialised to zero so the
+    adapter starts as an identity and the pretrained backbone is not
+    disturbed at step 0."""
     def __init__(self, dim: int, n_heads: int = 8, mlp_ratio: int = 4):
         super().__init__()
         self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
         self.norm_mlp = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, dim * mlp_ratio), nn.GELU(),
             nn.Linear(dim * mlp_ratio, dim),
         )
+        self.attn_gate = nn.Parameter(torch.zeros(1))
+        self.mlp_gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        qh = self.norm_q(q)
-        kh = self.norm_kv(kv)
-        a, _ = self.attn(qh, kh, kh, need_weights=False)
-        q = q + a
-        return q + self.mlp(self.norm_mlp(q))
+    def forward(self, hidden: torch.Tensor,
+                kv: torch.Tensor) -> torch.Tensor:
+        in_dtype = hidden.dtype
+        p_dtype = self.norm_q.weight.dtype
+        h = hidden.to(p_dtype)
+        k = kv.to(p_dtype)
+        q = self.norm_q(h)
+        a, _ = self.attn(q, k, k, need_weights=False)
+        h = h + torch.tanh(self.attn_gate) * a
+        m = self.norm_mlp(h)
+        out = h + torch.tanh(self.mlp_gate) * self.mlp(m)
+        return out.to(in_dtype)
 
 
+# ── Model ─────────────────────────────────────────────────────────────
 class GroundedReflex(nn.Module):
-    """Grounded RV32I control head.
+    """End-to-end grounded RV32I controller.
 
-    Forward flow at a single emission step:
-        1. Cached instruction hidden [B, T, H] is used as Q.
-        2. State encoder turns live [B, 65] state into K/V [B, 65, H].
-        3. Stack of cross-attention blocks refines Q using K/V.
-        4. Mean-pool Q (masked by instruction attention_mask) → ctx.
-        5. GRU(ctx ⊕ previous-instruction embed) → h_state.
-        6. Six classification heads → field logits.
+    Forward flow for one cycle:
+        1. State encoder turns live [B, 65] state into K/V [B, 65, H].
+        2. Backbone runs over instruction tokens; at every
+           ``INJECT_EVERY`` layers, a hook applies a
+           ``CrossAttnAdapter`` that fuses K/V into the hidden states.
+        3. Masked mean-pool over instruction tokens → [B, H].
+        4. Small MLP + six linear heads → RV32I field logits.
     """
-    def __init__(self, backbone, hidden: int, ctrl_dim: int = CTRL_DIM,
-                 n_xattn: int = N_XATTN_LAYERS,
-                 freeze_backbone: bool = True):
+    def __init__(self, backbone, hidden: int,
+                 inject_every: int = INJECT_EVERY,
+                 freeze_backbone: bool = False,
+                 adapter_mlp_ratio: int = 4):
         super().__init__()
         self.backbone = backbone
         self.hidden = hidden
-        self.ctrl_dim = ctrl_dim
+        self.inject_every = inject_every
         self.freeze_backbone = freeze_backbone
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
 
         self.state_encoder = StateEncoder(hidden)
-        self.xattn_blocks = nn.ModuleList(
-            [XAttnBlock(hidden) for _ in range(n_xattn)])
+        self.kv_norm = nn.LayerNorm(hidden)
 
-        self.pool_proj = nn.Linear(hidden, ctrl_dim)
-        self.prev_embeds = nn.ModuleList([
-            nn.Embedding(c, d) for c, d in zip(FIELD_CLASSES, FIELD_EMBED_DIMS)
-        ])
-        self.gru = nn.GRUCell(ctrl_dim + PREV_OP_DIM, ctrl_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(ctrl_dim, ctrl_dim * 2), nn.GELU(),
-            nn.Linear(ctrl_dim * 2, ctrl_dim),
+        layers = self._backbone_layers()
+        n = len(layers)
+        self.inject_indices = list(range(inject_every - 1, n, inject_every))
+        self.adapters = nn.ModuleList(
+            [CrossAttnAdapter(hidden, mlp_ratio=adapter_mlp_ratio)
+             for _ in self.inject_indices])
+
+        self.head_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden),
         )
-        self.heads = nn.ModuleList(
-            [nn.Linear(ctrl_dim, c) for c in FIELD_CLASSES])
+        self.bit_head = nn.Linear(hidden, N_INSTR_BITS)
 
-    def encode_instruction(self, input_ids, attention_mask) -> torch.Tensor:
-        """Once per task. Returns cached hidden [B, T, H] in fp32."""
-        ctx = torch.no_grad() if self.freeze_backbone else torch.enable_grad()
-        with ctx:
+        self._current_kv: torch.Tensor | None = None
+        self._hook_handles: list = []
+        self._register_hooks()
+
+    def _backbone_layers(self):
+        bb = self.backbone
+        if hasattr(bb, 'layers'):
+            return bb.layers
+        if hasattr(bb, 'model') and hasattr(bb.model, 'layers'):
+            return bb.model.layers
+        raise RuntimeError('Cannot locate backbone decoder layers')
+
+    adapter_checkpointing: bool = False      # toggled externally
+
+    def _register_hooks(self):
+        layers = self._backbone_layers()
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles = []
+        owner = self
+        for adapter, idx in zip(self.adapters, self.inject_indices):
+            def make_hook(adapter_ref):
+                def hook(module, inputs, output):
+                    kv = owner._current_kv
+                    if kv is None:
+                        return output
+                    def _apply(h):
+                        if owner.adapter_checkpointing and owner.training:
+                            return torch.utils.checkpoint.checkpoint(
+                                adapter_ref, h, kv, use_reentrant=False)
+                        return adapter_ref(h, kv)
+                    if isinstance(output, tuple):
+                        return (_apply(output[0]),) + output[1:]
+                    return _apply(output)
+                return hook
+            self._hook_handles.append(
+                layers[idx].register_forward_hook(make_hook(adapter)))
+
+    def forward(self, input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                state_vals: torch.Tensor) -> torch.Tensor:
+        """Returns [B, 32] raw bit logits (sigmoid at inference, BCE at train)."""
+        kv = self.kv_norm(self.state_encoder(state_vals))    # [B, 65, H]
+        self._current_kv = kv
+        try:
             out = self.backbone(input_ids=input_ids,
                                 attention_mask=attention_mask,
-                                output_hidden_states=False, return_dict=True,
-                                use_cache=False)
-        return out.last_hidden_state.to(torch.float32)
-
-    def decode_step(self, instr_hidden, instr_mask, state_vals,
-                    prev_fields, h_state):
-        kv = self.state_encoder(state_vals)              # [B, 65, H]
-        q = instr_hidden
-        for blk in self.xattn_blocks:
-            q = blk(q, kv)
-        m = instr_mask.unsqueeze(-1).float()
-        pooled = (q * m).sum(1) / m.sum(1).clamp_min(1.0)
-        ctx = self.pool_proj(pooled)
-
-        prev_parts = [emb(f) for emb, f in zip(self.prev_embeds, prev_fields)]
-        prev_emb = torch.cat(prev_parts, dim=-1)
-        h_state = self.gru(torch.cat([ctx, prev_emb], dim=-1), h_state)
-        out = h_state + self.mlp(h_state)
-        logits = [head(out) for head in self.heads]
-        return logits, h_state
+                                output_hidden_states=False,
+                                return_dict=True, use_cache=False)
+        finally:
+            self._current_kv = None
+        # Keep hidden states in the head's parameter dtype so fp32/bf16
+        # adapter heads both work. BCE loss in train.py casts logits to
+        # fp32 before computing the loss for numerical stability.
+        head_dtype = next(self.head_mlp.parameters()).dtype
+        h = out.last_hidden_state.to(head_dtype)
+        # Last-token pool: in a causal LLM the final real token has
+        # attended to every preceding token, so it encodes the full
+        # prompt (prefix + task) without the dilution that mean-pool
+        # suffers when a long shared prefix is present. We locate the
+        # final non-pad token via the attention_mask (Qwen uses
+        # right-padding by default).
+        last_idx = attention_mask.sum(dim=1).long() - 1      # [B]
+        pooled = h[torch.arange(h.size(0), device=h.device), last_idx]
+        feat = self.head_mlp(pooled)
+        return self.bit_head(feat)                           # [B, 32]
 
 
 def build_backbone(backbone_id: str = BACKBONE_ID,
-                   use_lora: bool = False,
-                   dtype: torch.dtype = torch.float16):
-    """Load a HuggingFace causal-LM backbone, optionally wrapped with LoRA."""
+                   dtype: torch.dtype = torch.bfloat16):
+    """Load a HuggingFace causal-LM backbone (fully unfrozen)."""
     from transformers import AutoModel, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(backbone_id)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     bb = AutoModel.from_pretrained(backbone_id, torch_dtype=dtype)
-    if use_lora:
-        from peft import LoraConfig, get_peft_model
-        bb = get_peft_model(bb, LoraConfig(
-            r=8, lora_alpha=16, lora_dropout=0.05, bias='none',
-            target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj']))
-    hidden = bb.config.hidden_size if not use_lora else bb.base_model.model.config.hidden_size
+    hidden = bb.config.hidden_size
     return bb, tok, hidden
 
 

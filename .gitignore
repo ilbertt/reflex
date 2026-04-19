@@ -17,3 +17,6 @@ wheels/
 *.pt
 
 *.log
+.claude/
+*.pt
+checkpoints/

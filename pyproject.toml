@@ -1,21 +1,23 @@
 [project]
 name = "reflex"
 version = "0.0.1"
-description = "Natural language → RV32I machine code, grounded in live machine state"
+description = "Wire a frozen LLM to a CPU through cross-attention. No text generated — one RV32I instruction per cycle, conditioned on live machine state."
 readme = "README.md"
-requires-python = ">=3.10"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "accelerate>=0.30",
     "numpy>=1.26",
-    "peft>=0.12",
-    "torch>=2.3",
-    "transformers>=4.45",
+    "rich>=13.7",
+    "torch==2.4.1",
+    "transformers>=4.45,<5",
     "unicorn>=2.1",
 ]
 
 [project.scripts]
 train = "reflex.train:main"
-demo = "reflex.demo:main"
+demo = "reflex.demo_tui:main"
+eval = "reflex.eval:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -23,3 +25,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["reflex*"]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
