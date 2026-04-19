@@ -4,7 +4,7 @@ version = "0.0.1"
 description = "Wire a frozen LLM to a CPU through cross-attention. No text generated — one RV32I instruction per cycle, conditioned on live machine state."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "accelerate>=0.30",
     "numpy>=1.26",
