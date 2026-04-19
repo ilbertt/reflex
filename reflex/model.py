@@ -19,9 +19,9 @@ import torch.nn as nn
 from .riscv import DATA_BASE, PROGRAM_START, Rv32i
 
 # ── Config ────────────────────────────────────────────────────────────
-BACKBONE_ID = 'Qwen/Qwen3-8B'
+BACKBONE_ID = 'Qwen/Qwen2.5-Coder-7B-Instruct'
 MAX_INSTR_TOKENS = 96
-INJECT_EVERY = 6                # cross-attn every N backbone layers
+INJECT_EVERY = 4                # cross-attn every N backbone layers → 7 adapters on 28-layer Coder-7B
 
 # Machine-context system message, passed through the backbone's chat
 # template as `<|im_start|>system ... <|im_end|><|im_start|>user ...

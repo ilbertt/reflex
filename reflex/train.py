@@ -13,12 +13,13 @@ autoregressive head — we flatten the collected per-cycle (instruction,
 state, target) triples into a pool and train with uniform random
 mini-batches against the 32 independent instruction-bit heads. The
 backbone is frozen; only the state encoder, cross-attn adapters, and
-head train. Mixed bf16 autocast, AdamW8bit, adapter gradient
-checkpointing — tuned to fit Qwen3-8B on 32 GB.
+head train. Mixed bf16 autocast, standard AdamW, field-weighted BCE
+(rs2 bits × 3 to counter polysemy). Default config tuned to fit
+Qwen2.5-Coder-7B-Instruct on A100 80GB at batch=64.
 
 Usage:
     uv run train
-    uv run train --backbone-id Qwen/Qwen2.5-Coder-3B-Instruct
+    uv run train --backbone-id Qwen/Qwen3-4B --batch 16
 """
 import argparse
 import hashlib
@@ -80,7 +81,7 @@ def collect_state_sequences(tasks, max_cycles: int = 5000):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--backbone-id', default=BACKBONE_ID)
-    ap.add_argument('--steps', type=int, default=7500)
+    ap.add_argument('--steps', type=int, default=15_000)
     ap.add_argument('--batch', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--ckpt', default='reflex.pt')
@@ -90,10 +91,10 @@ def main():
                     help='Prompt to run end-to-end every eval tick. '
                     'Format: "prompt=value" (checks mem[DATA_BASE]) or '
                     '"prompt@0xADDR=value".')
-    ap.add_argument('--inject-every', type=int, default=6,
+    ap.add_argument('--inject-every', type=int, default=4,
                     help='Insert a cross-attention adapter every N backbone '
-                    'layers. Larger = fewer adapters = less memory.')
-    ap.add_argument('--adapter-mlp-ratio', type=int, default=2)
+                    'layers. Default 4 → 9 adapters on a 36-layer backbone.')
+    ap.add_argument('--adapter-mlp-ratio', type=int, default=4)
     ap.add_argument('--max-instr-tokens', type=int, default=96)
     ap.add_argument('--sample-pool', type=int, default=300_000,
                     help='Subsample the flat cycle pool to this size, '
@@ -200,7 +201,6 @@ def main():
                            freeze_backbone=True,
                            adapter_mlp_ratio=args.adapter_mlp_ratio).to(device)
     backbone.eval()
-    model.adapter_checkpointing = True
 
     if args.resume:
         _ck = torch.load(args.resume, map_location='cpu', weights_only=False)
@@ -217,9 +217,8 @@ def main():
     n_new = sum(p.numel() for p in new_params) / 1e6
     print(f'trainable params: {n_new:.2f}M', flush=True)
 
-    import bitsandbytes as bnb
-    opt = bnb.optim.AdamW8bit([{'params': new_params, 'lr': args.lr}],
-                              weight_decay=0.01)
+    opt = torch.optim.AdamW([{'params': new_params, 'lr': args.lr}],
+                            weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.steps, eta_min=1e-6)
 
@@ -236,6 +235,14 @@ def main():
         (0, 7), (7, 12), (12, 15), (15, 20), (20, 25), (25, 32),
     )
 
+    # Field-weighted BCE. rs2 (bits 20-24) is polysemous (register on R-type
+    # but imm[4:0] on I/U/J-type) and consistently plateaus at ~0.89 while
+    # every other field converges to 1.00. Weighting its 5 bits at 3×
+    # roughly doubles rs2's gradient share (15/42 ≈ 36% vs 15.6% uniform),
+    # so it stops being drowned out by the already-solved bits.
+    bit_weights = torch.ones(N_INSTR_BITS, device=device)
+    bit_weights[20:25] = 3.0
+
     def run_batch(idx):
         B = len(idx)
         state = STATE_d[idx]
@@ -246,7 +253,8 @@ def main():
         with torch.autocast('cuda', dtype=torch.bfloat16,
                             enabled=(device == 'cuda')):
             logits = model(ids, mask, state)
-        loss = F.binary_cross_entropy_with_logits(logits.float(), tgts)
+        loss = F.binary_cross_entropy_with_logits(
+            logits.float(), tgts, weight=bit_weights)
         pred_bits = (logits > 0).long()
         bit_ok = (pred_bits == tgts.long())
         pfc = [bit_ok[:, lo:hi].all(dim=1).float().sum().item()
@@ -292,7 +300,13 @@ def main():
         torch.nn.utils.clip_grad_norm_(new_params, 1.0)
         opt.step(); sched.step()
 
-        if step % 50 == 0:
+        # Fast tick: just the training-batch loss (no extra forward needed).
+        if step % 50 == 0 and step % 500 != 0:
+            print(f'step {step:5d}  loss={loss.item():.4f}  '
+                  f'{time.time()-t_start:.0f}s', flush=True)
+
+        # Full eval tick: 512-sample forward for field metrics + probe + ckpt.
+        if step % 500 == 0:
             model.eval()
             with torch.no_grad():
                 eidx = torch.tensor(
