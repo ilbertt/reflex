@@ -232,27 +232,28 @@ def reflex_worker(state: DemoState, model, tok, device, max_instr_tokens=96,
     state.reflex_done = True
 
 
-# ── Throttled text streamer ──────────────────────────────────────────
+# ── Text streamer (unthrottled — stream at full GPU speed) ───────────
 class RichStreamer(TextStreamer):
-    def __init__(self, tok, state: DemoState, target_tps=30):
+    """Subclass of HuggingFace's TextStreamer that updates a DemoState
+    on every token. ``put()`` is called once per decoder step with a
+    single token id, so it gives us a true per-token count."""
+    def __init__(self, tok, state: DemoState):
         super().__init__(tok, skip_prompt=True, skip_special_tokens=True)
         self.state = state
-        self.interval = 1.0 / target_tps
-        self.last_t = None
+
+    def put(self, value):
+        super().put(value)
+        # value is a 1-D LongTensor of new token IDs for this step.
+        try:
+            n = value.numel()
+        except Exception:
+            n = 1
+        self.state.text_tok_count += n
+
     def on_finalized_text(self, text: str, stream_end: bool = False):
-        # Emit one char at a time so the animation looks natural even when
-        # HF batches tokens together at the end.
-        for ch in text:
-            self.state.text_out += ch
-            if ch.strip():
-                self.state.text_tok_count += 1 / 4  # ~4 chars/token approx
-            self.state.text_dt_ms = int(
-                (time.time() - self.state.text_start) * 1000)
-            if self.last_t is not None:
-                elapsed = time.time() - self.last_t
-                if elapsed < self.interval:
-                    time.sleep(self.interval - elapsed)
-            self.last_t = time.time()
+        self.state.text_out += text
+        self.state.text_dt_ms = int(
+            (time.time() - self.state.text_start) * 1000)
 
 
 # ── Tiny assembler for the text-mode output ──────────────────────────
@@ -495,7 +496,7 @@ def text_worker(state: DemoState, causal_lm, tok, device, max_new_tokens=256):
                                        add_generation_prompt=True)
         enc = tok(text, return_tensors='pt').to(device)
         state.text_start = time.time()
-        streamer = RichStreamer(tok, state, target_tps=30)
+        streamer = RichStreamer(tok, state)
         if TEXT_STREAM is not None:
             with torch.cuda.stream(TEXT_STREAM):
                 causal_lm.generate(
@@ -625,9 +626,11 @@ def render_layout(state: DemoState) -> Layout:
     iter_str = (f'iter {state.reflex_iter}/3'
                 if state.reflex_total_iters > 1 or not state.reflex_done
                 else '')
-    parts = [f'{state.reflex_op_count} ops',
-             f'{state.reflex_dt_ms} ms',
-             '0 tokens']
+    # One forward pass = one emitted 32-bit instruction word — the same
+    # "one forward = one token" accounting used for text mode, just with
+    # a 4-byte machine-code token instead of a vocab token.
+    parts = [f'{state.reflex_op_count} tokens (= ops)',
+             f'{state.reflex_dt_ms} ms']
     if iter_str: parts.append(iter_str)
     parts.append(status)
     reflex_footer = ' · '.join(parts)
@@ -654,8 +657,9 @@ def render_layout(state: DemoState) -> Layout:
     else:
         body_inner = Text(state.text_out, style='white')
         status_t = 'DONE' if state.text_done else 'STREAMING'
-    text_footer = (f'~{int(state.text_tok_count)} tokens · '
-                   f'{state.text_dt_ms} ms · {state.text_ops_run} ops · {status_t}')
+    text_footer = (f'{int(state.text_tok_count)} tokens · '
+                   f'{state.text_dt_ms} ms · '
+                   f'{state.text_ops_run} asm ops · {status_t}')
     layout['right_ops'].update(Panel(
         body_inner,
         title='[bold blue]Text mode[/] — writes asm → assembled → run in Unicorn',
