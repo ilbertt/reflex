@@ -87,6 +87,10 @@ def main():
     ap.add_argument('--ckpt', default='reflex.pt')
     ap.add_argument('--resume', default=None,
                     help='Load adapter/head weights from this checkpoint.')
+    ap.add_argument('--init-step', type=int, default=0,
+                    help='Advance the cosine LR scheduler this many steps on '
+                    'startup so a --resume continues the schedule smoothly '
+                    'instead of re-hitting peak LR.')
     ap.add_argument('--probe', default=None,
                     help='Prompt to run end-to-end every eval tick. '
                     'Format: "prompt=value" (checks mem[DATA_BASE]) or '
@@ -219,8 +223,16 @@ def main():
 
     opt = torch.optim.AdamW([{'params': new_params, 'lr': args.lr}],
                             weight_decay=0.01)
+    # Include prior steps in T_max so the cosine continues smoothly from
+    # wherever a previous run stopped instead of restarting from peak LR.
+    sched_total = args.steps + args.init_step
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.steps, eta_min=1e-6)
+        opt, T_max=sched_total, eta_min=1e-6)
+    for _ in range(args.init_step):
+        sched.step()
+    if args.init_step:
+        print(f'cosine resumed: step {args.init_step}/{sched_total} → '
+              f'lr={sched.get_last_lr()[0]:.2e}', flush=True)
 
     def trainable_state_dict():
         full = model.state_dict()
@@ -241,7 +253,7 @@ def main():
     # roughly doubles rs2's gradient share (15/42 ≈ 36% vs 15.6% uniform),
     # so it stops being drowned out by the already-solved bits.
     bit_weights = torch.ones(N_INSTR_BITS, device=device)
-    bit_weights[20:25] = 3.0
+    bit_weights[20:25] = 5.0
 
     def run_batch(idx):
         B = len(idx)

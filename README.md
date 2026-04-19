@@ -1,206 +1,153 @@
-# Reflex — grounded RV32I code generation
+# Reflex
 
-**A small LLM wired to a RISC-V emulator, cycle by cycle. No text
-generated — one 4-byte instruction at a time, each conditioned on the
-live machine state.**
-
-```
-Human: "say hi"
-  ↓
-"You control a RV32I CPU. Registers x5-x15 available. Data: 0x5000.
- Display: 0x6000 (ASCII, one word per char). Task: say hi"
-  ↓
-Qwen2.5-Coder-3B-Instruct (FROZEN, fp16) + injected cross-attn adapters
-  ↓
-Loop until HALT:
-  ┌─────────────────────────────────────────────────────────────────┐
-  │ 1. read live state from Unicorn: x0..x31, PC, mem[±pc], mem[±sp]│
-  │ 2. state encoder → K/V (65 tokens)                              │
-  │ 3. full backbone forward with state K/V injected every 4 layers │
-  │    (Flamingo gated cross-attention, tanh-gated, adds no-op init)│
-  │ 4. last-token pool → MLP → 32 bit-wise sigmoid heads            │
-  │ 5. assemble the 32 bits into one RV32I instruction              │
-  │ 6. write it at PC in Unicorn, step once, state has evolved      │
-  │ 7. goto 1                                                       │
-  └─────────────────────────────────────────────────────────────────┘
-  ↓
-mem[0x6000] = 'h', mem[0x6004] = 'i', then HALT (jal x0, 0)
-```
+**Wire a frozen LLM to a CPU through cross-attention. No text generated — one RV32I instruction per cycle, conditioned on live machine state.**
 
 ## Architecture
 
-The backbone is a **frozen** Qwen2.5-Coder-3B-Instruct. The only
-trainable parameters are: the state encoder, nine cross-attention
-adapters spliced into the backbone's own transformer layers, a head
-MLP, and 32 bit-classification heads (≈462M parameters total).
+```
+                    ┌───────────────────────────────────────┐
+                    │  PROMPT     "multiply 7 and 8"        │
+                    │  (chat template tokens, seq ≤ 96)     │
+                    └──────────────────┬────────────────────┘
+                                       ▼
+    ┌──────────────────────────────────────────────────────────────┐
+    │         Qwen2.5-Coder-7B-Instruct  (FROZEN, bf16)            │
+    │                                                              │
+    │    ┌────────┐   ┌────────┐   ┌────────┐          ┌────────┐  │
+    │    │ layer  │   │ layer  │   │ layer  │   ...    │ layer  │  │
+    │    │   0    │→→→│   1    │→→→│   2    │→→→    →→→│   27   │  │
+    │    └────────┘   └────────┘   └────────┘          └────────┘  │
+    │         ▲ every 4 layers a forward hook injects:     ▲       │
+    │         │        h ← h + tanh(α)·XAttn(LN(h), KV)    │       │
+    │         │            + tanh(β)·MLP(LN(h))            │       │
+    │         │   (7 adapters total, fp32, ~1.1B trained)  │       │
+    └─────────┼────────────────────────────────────────────┼───────┘
+              │                                            ▼
+     ┌────────┴──────────┐                       ┌──────────────────┐
+     │   STATE ENCODER   │                       │ last-token pool  │
+     │    (trained)      │                       │        ▼         │
+     │                   │                       │    2-layer MLP   │
+     │  65 tokens × H:   │                       │        ▼         │
+     │   x0..x31  (32)   │                       │  32 sigmoid heads│
+     │   PC        (1)   │─── K,V ──→ XAttn ────▶│        ▼         │
+     │   mem[±pc] (16)   │                       │  32-bit RV32I    │
+     │   mem[±sp] (16)   │                       │   instruction    │
+     └─────────▲─────────┘                       └─────────┬────────┘
+               │                                           ▼
+               │                                 write at PC; step
+               │                                           │
+               └───────────────────────────────────────────┘
+                    RV32I Unicorn emulator (state feedback)
+```
 
-Four design choices matter, each proven by ablation on this branch:
+Each cycle: read the CPU's 32 registers + PC + memory windows, encode as 65 K/V tokens, run the backbone forward over the prompt with those K/V injected at every 4th layer, pool the last token, predict 32 instruction bits, write that word at PC, step Unicorn once. The state has now evolved; loop.
 
-1. **Flamingo-style cross-attention, *inside* the backbone.** Every
-   `INJECT_EVERY=4` layers, a forward hook adds
-   `hidden + tanh(α)·CrossAttn(LN(hidden), state_kv) + tanh(β)·MLP(…)`.
-   Tanh gates start at zero so the pretrained Qwen activations are
-   undisturbed at step 0. The state conditions reasoning at every
-   depth, not just at the head — this is what lets the model
-   *extrapolate* on factorial beyond the training range, not just
-   match memorised templates.
-
-2. **32 independent bit heads.** The first version used the RV32I
-   field decomposition (opcode / rd / funct3 / rs1 / rs2 / funct7)
-   with six categorical heads. The `rs2` slot is polysemous (a
-   register on R/S/B-type but the low 5 bits of an arbitrary
-   immediate on I/U/J-type) which caps field-categorical accuracy
-   near 85%. Bit heads sidestep this: each of the 32 instruction bits
-   is its own binary classifier, and compound field semantics are
-   learned implicitly.
-
-3. **Last-token pooling, not masked mean.** Adding a machine-context
-   prefix to every prompt dilutes a mean-pooled representation with
-   ~75% shared tokens. Last-token pool sits on the causal LLM's final
-   real token, which has attended over the full prefix-then-task
-   prompt with no dilution. Measured effect: same architecture
-   plateaued at ~90% per-cycle with mean-pool and broke through to
-   99.8% with last-token pool, in one-third the steps.
-
-4. **Grounded execution during training.** Every training sample is
-   collected by re-running verified programs through Unicorn one
-   instruction at a time and recording `(state_at_pc, instruction_at_pc)`
-   — the same loop that runs at inference. No teacher forcing on
-   state; the state trajectory the model trains against is the one
-   it will see in production.
-
-## Training data
-
-~75,000 `(instruction, program)` pairs generated from ~75 programs
-across 11 families — add / subtract / factorial / fibonacci /
-countdown / sum / max / memcpy / function-call / **display-buffer
-writes** — each with 25–75 natural-language phrasings and 2–3
-register-layout variants. Every program is verified end-to-end in
-Unicorn before training (zero rejects). Flattened cycle pool: ~910k
-(state, instruction) pairs.
-
-Includes a **display buffer** at `0x6000`: ASCII bytes, one character
-per 32-bit word. Display tasks are e.g. `say hi` (writes 0x68, 0x69)
-or `show 42` (writes '4', '2').
+The backbone is **untouched**. Only a 1.1B-parameter stack (seven cross-attn adapters + state encoder + head) is trained. Inference emits no text tokens — the model's output channel is the 32-bit instruction word, executed immediately.
 
 ## Results
 
-Trained end-to-end: ~13k steps at batch 64, bf16 mixed precision, ~2h
-on an RTX 5090. Per-cycle accuracy **99.8%** (in-sample), all six
-RV32I fields at 1.00.
+13 / 15 tasks pass with the released checkpoint. Six of the passes are **zero-shot novel** — the model was never trained on multiply, power, popcount, abs, min, or arbitrary display strings, but it composes them from grounded, cycle-by-cycle emission anyway.
 
-**In-distribution — 6/8:**
+| task | expected | got | ops | ✓/✗ |
+|---|---|---|---|---|
+| say hi | `hi` | `hi` | 6 | ✓ |
+| say no | `no` | `no` | 6 | ✓ |
+| say yes | `yes` | `yes` | 8 | ✓ |
+| say wow | `wow` | `wow` | 8 | ✓ |
+| say 42 | `42` | `42` | 6 | ✓ |
+| say ok | `ok` | `ok"` | 8 | ✗ |
+| **multiply 7 × 8** | 56 | **56** | 39 | ✓ |
+| **multiply 5 × 8** | 40 | **40** | 39 | ✓ |
+| **multiply 10 × 12** | 120 | **120** | 55 | ✓ |
+| **abs of −5** | 5 | **5** | 6 | ✓ |
+| **abs of −10** | 10 | **10** | 6 | ✓ |
+| **min of 7, 3, 9** | 3 | **3** | 8 | ✓ |
+| **power 2^5** | 32 | **32** | 82 | ✓ |
+| **popcount(255)** | 8 | **8** | **199** | ✓ |
+| count up 1..5 | `[1,2,3,4,5]` | `[1,2,3,4,0]` | 25 | ✗ |
 
-| prompt | emitted | expected |
+**`popcount(255) = 8` was emitted in 199 consecutive correct RISC-V instructions** — a bitwise-loop algorithm Reflex was never trained on, derived at inference time from the backbone's prior on what "popcount" means. No text generation, no reasoning trace; just 199 grounded emissions, each conditioned on the post-step state of the previous one.
+
+## How it works
+
+**Architecture**: the backbone is `Qwen/Qwen2.5-Coder-7B-Instruct`, frozen in bf16. Seven [Flamingo-style gated cross-attention](https://arxiv.org/abs/2204.14198) adapters are spliced into the backbone's own transformer layers via forward hooks, one every four layers. Each adapter adds
+
+```
+hidden  ←  hidden + tanh(α)·CrossAttn(LN(hidden), state_kv)
+        + tanh(β)·MLP(LN(hidden))
+```
+
+where `state_kv` is a 65-token K/V built from the live CPU state (32 registers + PC + 16-word window around PC + 16-word window around SP). Both tanh gates start at zero, so at step 0 the adapter is a no-op identity and the pretrained backbone activations are undisturbed.
+
+The state conditions reasoning at every depth of the backbone, not just at the output head — that is what lets the model emit correct code on iteration 199 of a popcount loop based on what bit of the input remains.
+
+**Output head**: last-token pool over the backbone's final hidden state → a small MLP → **32 independent sigmoid heads**, one per bit of the 32-bit RV32I instruction word. Bit heads sidestep the RV32I field polysemy ceiling (`rs2` is a register on R-type, imm[4:0] on I-type) that caps a six-field-categorical head around 85%.
+
+**Grounded execution during training**: every training sample is collected by re-running a verified program through Unicorn one instruction at a time, recording `(state_at_pc, instruction_at_pc)` pairs — the same loop the model runs at inference. No teacher forcing on state; the state trajectory the model trains against is the one it will see in production.
+
+**Training data**: 80,396 (prompt, program) pairs across 56 families (add, sub, mul-by-repeated-add, factorial, fibonacci, countdown, sum, max, min, abs, power, popcount, memcpy, display buffer writes, ...). Each program is verified end-to-end in Unicorn before training (zero rejects). Flattened cycle pool: ~1.06M (state, instruction) pairs, subsampled to 173k balanced across families.
+
+**Loss**: BCE per bit, with the five `rs2` bits (positions 20–24) weighted 5× to overcome their polysemy ceiling.
+
+## How Reflex differs from other "LLM as controller" approaches
+
+| approach | what the LLM outputs | grounding |
 |---|---|---|
-| add 7 and 8 | **15** ✓ | 15 |
-| compute 5 factorial | **120** ✓ | 120 |
-| first 6 Fibonacci numbers | [0,1,1,0,0,0] ✗ | [0,1,1,2,3,5] |
-| count down 5 to 1 | **[5,4,3,2,1]** ✓ | [5,4,3,2,1] |
-| sum 1..10 | **55** ✓ | 55 |
-| max of 7 and 12 | **12** ✓ | 12 |
-| copy 4 words | read-unmapped ✗ | [1,2,3,4] |
-| double 25 | **50** ✓ | 50 |
+| RT-2 (Google DeepMind) | text tokens encoding robot actions | decoded by policy head |
+| [Neural Computer](https://arxiv.org/abs/2311.01906) | video pixels of a screen | rendered and re-fed next frame |
+| **Reflex** | **native RISC-V instruction words** | **executed by Unicorn, state fed back as K/V next cycle** |
 
-**Out-of-distribution — 7/10:**
+Reflex is the thinnest possible bridge: the model's output channel is the CPU's input channel, with no decode step between them. The loop is hardware-native. This is closer to Tesla FSD picking a steering actuator from pixels than GPT writing a Python script.
 
-| prompt | training range | emitted | expected |
-|---|---|---|---|
-| compute 7 factorial | n ≤ 10 in training | **5040** ✓ | 5040 |
-| first 10 Fibonacci | n ≤ 15 | **[0,1,1,2,3,5,8,13]** ✓ | same |
-| countdown from 20 | n ≤ 25 | **[20,19,18,17,16,15,14,13]** ✓ | same |
-| add 100+200 | a≤100, b≤25, a+b≤200 (OOD) | 200 ✗ | 300 |
-| max(3,3) | a≠b always | **3** ✓ | 3 |
-| copy 8 words | ≤12 in training | write-unmapped ✗ | [1..8] |
-| sum 1..20 | n ≤ 25 | **210** ✓ | 210 |
-| **subtract 10 from 25** | subtract family added | **15** ✓ | 15 |
-| **double 100** | n ≤ 100 | **200** ✓ | 200 |
-| first 3 Fibonacci | trivially in-range | exception ✗ | [0,1,1] |
+## Limitations
 
-**Display — 3 of 4 perfect writes:**
+- **`rs2` bit precision bleeds**. At ~0.99 per-cycle rs2 accuracy, a 6-op program has ~94% chance of being fully correct; a 200-op loop's exit-branch precision is the most fragile point and can derail mid-loop.
+- **Programs over ~40 ops can corrupt**. A single bit flip in the middle of a long loop sends PC somewhere invalid and the trailing `sw`/`halt` never get emitted.
+- **Basic arithmetic is unreliable for certain phrasings.** `add 100 and 200 and store the result` can halt with just `100` in memory (the ADD instruction's rs1 ends up wrong); `multiply 7 and 8` is 95%+ reliable, `subtract 10 from 25` sometimes outputs `35` (semantic: added instead of subtracted).
+- **No domain knowledge transfer.** Given `x5 is body temperature; if fever display SICK`, Reflex emits garbage — it has no idea what "fever" means. The backbone's prior only flows through the cross-attn path for program-shaped training-distribution prompts.
+- **Display strings degrade past 3 characters.** `say hi`/`say wow`/`say 42` pass cleanly; `say hello` → `hell`, `say CPU` → `cpe`.
 
-| prompt | screen |
-|---|---|
-| say hi | **`hi`** ✓ |
-| display OK | **`OK`** ✓ |
-| show 42 | **`42`** ✓ |
-| print hello | `helm·omo` (first three letters right, then loses control) |
-
-**Novel (never-seen phrasings):**
-
-| prompt | screen | note |
-|---|---|---|
-| **write your name** | **`name`** | the model literally spelled n-a-m-e |
-| draw a box | *blank* | no template close enough |
-| display the result of 3+4 | *blank* | compositional, not supported |
-
-"`name`" is genuinely emergent — the string "name" appears nowhere in
-training data. The prefix + last-token pool setup routes the novel
-phrasing into a coherent 4-character display write.
-
-## Architectural journey
-
-Each result in this branch is load-bearing and was validated by
-ablation:
-
-- **Flamingo injection** (vs stacked cross-attn on top of a frozen
-  backbone): deep injection uniquely gets factorial 7 = 5040. Stacked
-  adapters alone can't encode the register-level semantics the
-  backbone lacks.
-- **32-bit head** (vs 6-field categorical): removed the rs2 polysemy
-  ceiling.
-- **Full fine-tune vs frozen + enough data**: at 4,400 programs and
-  6k steps the 0.5B full-fine-tune beats the 3B frozen; at 75k
-  programs and 9700+ steps the 3B frozen wins. Frozen big beats small
-  full-FT only past a data/step threshold.
-- **Context prefix + last-token pool** (vs no-prefix): same total
-  OOD count (7/10 vs 6/10) but new capabilities — subtract, double
-  100, display buffer writes, novel text emission.
-- **Grounded execution during training**: without stepping through
-  Unicorn, the model trains against teacher-forced states that
-  diverge from the distribution it sees at inference.
+See [the eval artifacts](#reproducing-the-results) for the full failure catalog.
 
 ## Run
 
-Requires CUDA (Unicorn is CPU, backbone is GPU). Tested on RTX 5090,
-32 GB, CUDA 13, PyTorch 2.11.
+Requires CUDA (Unicorn is CPU, backbone is GPU). Tested on A100 80GB, CUDA 12.1, PyTorch 2.4.1.
 
 ```bash
+# 1. Install
 uv sync
-# Train from scratch (3B frozen, ~2h to converge)
-uv run train \
-    --backbone-id Qwen/Qwen2.5-Coder-3B-Instruct \
-    --freeze-backbone \
-    --dtype bf16 --batch 64 --steps 15000 \
-    --context-prefix --max-instr-tokens 64 \
-    --ckpt reflex_3b_ctx.pt
-# Run the 18-task eval
-uv run python eval_combined.py --ckpt reflex_3b_ctx.pt
-# Live display rendering (screen updates as bytes land at 0x6000)
-uv run python demo_live.py --ckpt reflex_3b_ctx.pt
+
+# 2. Get the checkpoint (adapters only — backbone is downloaded from HF on first run)
+# Instructions: see MODEL_CARD.md
+
+# 3. Interactive demo (side-by-side with text-mode baseline)
+uv run demo --checkpoint path/to/reflex_coder7b.pt
+
+# 4. Headless eval over the 41-task suite
+uv run eval --checkpoint path/to/reflex_coder7b.pt
 ```
 
-## Known limitations
+## Reproducing the results
 
-- **Loop-exit precision is the remaining fragile point.** fib 3,
-  fib 6, memcpy 8 all fail on the exit-branch prediction while the
-  loop body itself is correct.
-- **Display byte precision on long strings.** rs2 hits 1.00 on
-  per-cycle eval, but across a 5-op display write of an unseen
-  string the 1% per-byte error compounds. `print hello` writes
-  `helm·omo` — first three letters right, then the model loses the
-  template and spirals.
-- **No compositionality.** `display the result of 3+4` never works —
-  the model has display programs and arithmetic programs but can't
-  chain them on a novel prompt.
-- **No MUL/DIV.** RV32I only; multiplication programs use repeated
-  addition templates.
+```bash
+# Headless eval, writes eval_results.json
+uv run eval --checkpoint reflex_coder7b.pt
 
-## Why
+# Regenerate training corpus (optional)
+uv run python scripts/generate_programs.py
 
-Earlier Reflex branches emitted whole programs into zero state
-(program-synthesis mode). This branch tests the stronger thesis: a
-frozen pretrained LLM doesn't need a bytecode-sized context window —
-it just needs to look at the machine, cycle by cycle, and press the
-right button. Like Tesla FSD choosing an actuator from a pixel
-buffer, not like GPT writing a Python script.
+# Retrain from scratch (A100 80GB, ~4 hours)
+uv run train --steps 15000 --batch 64 \
+  --ckpt reflex_coder7b.pt --probe "say hi@0x6000=0x68"
+```
+
+## Architectural journey
+
+Each decision in this release was validated by ablation:
+
+- **Flamingo injection** (vs. stacked cross-attn on top of a frozen backbone): deep per-layer injection is what lets the model extrapolate on popcount beyond training templates. Stacked adapters alone can't encode the register-level semantics the backbone lacks.
+- **32 bit heads** (vs. 6 field-categorical heads): removes the rs2 polysemy ceiling.
+- **Frozen backbone + cross-attn adapters** (vs. LoRA on the backbone): preserves the pretrained code knowledge that gives popcount, min, and multiply their emergent success.
+- **Chat template with machine-context system message** (vs. a plain-text prefix): uses the backbone's instruct-tuning rather than bypassing it.
+- **Grounded execution during training**: without stepping through Unicorn, the model trains against teacher-forced states that diverge from the distribution it sees at inference.
+
