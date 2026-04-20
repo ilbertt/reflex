@@ -264,7 +264,11 @@ def main():
         mask = INSTR_MASK_d[ii]
         with torch.autocast('cuda', dtype=torch.bfloat16,
                             enabled=(device == 'cuda')):
-            logits = model(ids, mask, state)
+            # Flat random-batch training: no sequential context is available,
+            # so prev_hidden stays None. Latent Recurrence kicks in at eval
+            # time where run_grounded threads the pooled hidden state across
+            # Unicorn cycles.
+            logits, _ = model(ids, mask, state, None)
         loss = F.binary_cross_entropy_with_logits(
             logits.float(), tgts, weight=bit_weights)
         pred_bits = (logits > 0).long()

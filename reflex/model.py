@@ -253,9 +253,20 @@ class GroundedReflex(nn.Module):
 
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
-                state_vals: torch.Tensor) -> torch.Tensor:
-        """Returns [B, 32] raw bit logits (sigmoid at inference, BCE at train)."""
+                state_vals: torch.Tensor,
+                prev_hidden: torch.Tensor | None = None,
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (logits[B,32], pooled[B,H]).
+
+        ``pooled`` is the Latent Recurrence thought vector — caller threads
+        it back in as ``prev_hidden`` on the next cycle so the model carries
+        temporal context across the Unicorn step loop without polluting
+        the CPU state with chain-of-thought tokens.
+        """
         kv = self.kv_norm(self.state_encoder(state_vals))    # [B, 65, H]
+        if prev_hidden is not None:
+            # Append the pooled thought vector from t-1 → [B, 66, H].
+            kv = torch.cat([kv, prev_hidden.unsqueeze(1).to(kv.dtype)], dim=1)
         self._current_kv = kv
         try:
             out = self.backbone(input_ids=input_ids,
@@ -264,21 +275,16 @@ class GroundedReflex(nn.Module):
                                 return_dict=True, use_cache=False)
         finally:
             self._current_kv = None
-        # Keep hidden states in the head's parameter dtype so fp32/bf16
-        # adapter heads both work. BCE loss in train.py casts logits to
-        # fp32 before computing the loss for numerical stability.
         head_dtype = next(self.head_mlp.parameters()).dtype
         h = out.last_hidden_state.to(head_dtype)
-        # Last-token pool: in a causal LLM the final real token has
-        # attended to every preceding token, so it encodes the full
-        # prompt (prefix + task) without the dilution that mean-pool
-        # suffers when a long shared prefix is present. We locate the
-        # final non-pad token via the attention_mask (Qwen uses
-        # right-padding by default).
         last_idx = attention_mask.sum(dim=1).long() - 1      # [B]
         pooled = h[torch.arange(h.size(0), device=h.device), last_idx]
         feat = self.head_mlp(pooled)
-        return self.bit_head(feat)                           # [B, 32]
+        logits = self.bit_head(feat)                         # [B, 32]
+        # Detach the latent so gradients don't flow across the full program
+        # at eval time (and to avoid unbounded BPTT if someone wires this
+        # into a sequential training loop).
+        return logits, pooled.detach()
 
 
 def build_backbone(backbone_id: str = BACKBONE_ID,
