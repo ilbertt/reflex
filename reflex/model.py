@@ -266,7 +266,10 @@ class GroundedReflex(nn.Module):
         kv = self.kv_norm(self.state_encoder(state_vals))    # [B, 65, H]
         if prev_hidden is not None:
             # Append the pooled thought vector from t-1 → [B, 66, H].
-            kv = torch.cat([kv, prev_hidden.unsqueeze(1).to(kv.dtype)], dim=1)
+            # Norm the latent through the same LayerNorm as the state K/V
+            # so adapters see a consistent scale across all 66 tokens.
+            prev = self.kv_norm(prev_hidden.unsqueeze(1).to(kv.dtype))
+            kv = torch.cat([kv, prev], dim=1)
         self._current_kv = kv
         try:
             out = self.backbone(input_ids=input_ids,

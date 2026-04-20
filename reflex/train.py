@@ -33,8 +33,8 @@ import torch
 import torch.nn.functional as F
 
 from .model import (
-    BACKBONE_ID, FIELD_NAMES, N_INSTR_BITS, GroundedReflex, build_backbone,
-    code_region_halt_fill, extract_state, render_prompt,
+    BACKBONE_ID, FIELD_NAMES, N_INSTR_BITS, N_STATE_TOKENS, GroundedReflex,
+    build_backbone, code_region_halt_fill, extract_state, render_prompt,
 )
 from .programs import SRC_OFFSET, load_tasks
 from .riscv import DATA_BASE, HALT_INSTR, PROGRAM_START, Rv32i
@@ -103,6 +103,12 @@ def main():
     ap.add_argument('--sample-pool', type=int, default=300_000,
                     help='Subsample the flat cycle pool to this size, '
                     'balanced across families. 0 disables.')
+    ap.add_argument('--seq-window', type=int, default=1,
+                    help='Latent Recurrence training window. W=1 keeps the '
+                    'legacy flat-pool training (prev_hidden=None, 65-token '
+                    'K/V). W>1 samples W-cycle windows per batch item and '
+                    'unrolls prev_hidden across them so the adapters see '
+                    '66-token K/V at train time too, matching inference.')
     args = ap.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -199,6 +205,66 @@ def main():
     INSTR_IDS_d = enc.input_ids.to(device)
     INSTR_MASK_d = enc.attention_mask.to(device)
 
+    # ── Latent Recurrence window pool ──
+    # W-cycle sliding windows over each program. Used when --seq-window > 1
+    # so training exercises the 66-token K/V path (prev_hidden threaded
+    # across cycles) the same way inference does.
+    W = max(1, args.seq_window)
+    if W > 1:
+        win_instr, win_state, win_word, win_mask, win_family = [], [], [], [], []
+        for fam, txt, seq in seqs:
+            ii = instr_idx[txt]
+            T = len(seq)
+            if T == 0:
+                continue
+            for start in range(T):
+                end = min(start + W, T)
+                states_w = np.zeros((W, N_STATE_TOKENS), dtype=np.int64)
+                words_w = np.zeros(W, dtype=np.uint32)
+                mask_w = np.zeros(W, dtype=np.float32)
+                for j in range(end - start):
+                    states_w[j] = seq[start + j][0].astype(np.int64)
+                    words_w[j] = int(seq[start + j][1]) & 0xFFFFFFFF
+                    mask_w[j] = 1.0
+                win_instr.append(ii)
+                win_state.append(states_w)
+                win_word.append(words_w)
+                win_mask.append(mask_w)
+                win_family.append(fam)
+        Nw_full = len(win_instr)
+        print(f'window-pool size (W={W}) = {Nw_full}', flush=True)
+
+        if args.sample_pool and args.sample_pool < Nw_full:
+            import collections as _coll
+            by_fam = _coll.defaultdict(list)
+            for i, f in enumerate(win_family):
+                by_fam[f].append(i)
+            per_fam = max(1, args.sample_pool // len(by_fam))
+            rng = np.random.default_rng(0)
+            keep_idx = []
+            for f, idxs in by_fam.items():
+                take = min(len(idxs), per_fam)
+                keep_idx.extend(rng.choice(idxs, size=take, replace=False).tolist())
+            keep_idx = np.array(sorted(keep_idx), dtype=np.int64)
+            win_instr = [win_instr[i] for i in keep_idx]
+            win_state = [win_state[i] for i in keep_idx]
+            win_word = [win_word[i] for i in keep_idx]
+            win_mask = [win_mask[i] for i in keep_idx]
+            print(f'balanced window subsample → {len(win_instr)}', flush=True)
+
+        Nw = len(win_instr)
+        win_bits = np.zeros((Nw, W, N_INSTR_BITS), dtype=np.float32)
+        win_words_np = np.stack(win_word)  # [Nw, W]
+        for i in range(N_INSTR_BITS):
+            win_bits[:, :, i] = ((win_words_np >> i) & 1).astype(np.float32)
+
+        WIN_INSTR_IDX_d = torch.from_numpy(np.array(win_instr, dtype=np.int64)).to(device)
+        WIN_STATE_d = torch.from_numpy(np.stack(win_state)).to(device)   # [Nw, W, 65]
+        WIN_BITS_d = torch.from_numpy(win_bits).to(device)               # [Nw, W, 32]
+        WIN_MASK_d = torch.from_numpy(np.stack(win_mask)).to(device)     # [Nw, W]
+    else:
+        Nw = 0
+
     # ── Model ──
     model = GroundedReflex(backbone, HIDDEN,
                            inject_every=args.inject_every,
@@ -278,6 +344,48 @@ def main():
         fc = bit_ok.all(dim=1).float().sum().item()
         return loss, pfc, fc, B
 
+    def run_window_batch(idx):
+        """Unroll W cycles per sample with prev_hidden threaded through.
+
+        Each batch item is a W-cycle slice from one program. We detach
+        prev_hidden between steps (TBPTT=1), matching inference.
+        """
+        B = len(idx)
+        state_w = WIN_STATE_d[idx]     # [B, W, 65]
+        tgts_w = WIN_BITS_d[idx]       # [B, W, 32]
+        mask_w = WIN_MASK_d[idx]       # [B, W]
+        ii = WIN_INSTR_IDX_d[idx]
+        ids = INSTR_IDS_d[ii]
+        mask = INSTR_MASK_d[ii]
+        prev_hidden = None
+        loss_sum = torch.zeros((), device=device)
+        mask_sum = torch.zeros((), device=device)
+        pfc_accum = [0.0] * len(FIELD_BIT_SLICES)
+        fc_accum = 0.0
+        B_valid = 0.0
+        with torch.autocast('cuda', dtype=torch.bfloat16,
+                            enabled=(device == 'cuda')):
+            for w in range(W):
+                logits, prev_hidden = model(ids, mask, state_w[:, w],
+                                            prev_hidden)
+                step_mask = mask_w[:, w]
+                if step_mask.sum() == 0:
+                    continue
+                bce = F.binary_cross_entropy_with_logits(
+                    logits.float(), tgts_w[:, w],
+                    weight=bit_weights, reduction='none').mean(dim=-1)  # [B]
+                loss_sum = loss_sum + (bce * step_mask).sum()
+                mask_sum = mask_sum + step_mask.sum()
+                pred_bits = (logits > 0).long()
+                bit_ok = (pred_bits == tgts_w[:, w].long())
+                for i, (lo, hi) in enumerate(FIELD_BIT_SLICES):
+                    pfc_accum[i] += (bit_ok[:, lo:hi].all(dim=1).float()
+                                     * step_mask).sum().item()
+                fc_accum += (bit_ok.all(dim=1).float() * step_mask).sum().item()
+                B_valid += step_mask.sum().item()
+        loss = loss_sum / mask_sum.clamp(min=1.0)
+        return loss, pfc_accum, fc_accum, int(B_valid)
+
     # Optional end-to-end probe. Format: "prompt=value" or "prompt@0xADDR=value".
     probe_prompt = probe_expected = probe_addr = None
     if args.probe:
@@ -303,15 +411,20 @@ def main():
         print(f'  probe {mark} ops={len(emitted)} halted={halted} '
               f'mem[0x{probe_addr:x}]={got} (want {probe_expected})', flush=True)
 
-    print(f'training {args.steps} steps batch={args.batch}', flush=True)
+    pool_size = Nw if W > 1 else N
+    batch_fn = run_window_batch if W > 1 else run_batch
+    mode_tag = f'seq-window (W={W})' if W > 1 else 'flat-pool'
+    print(f'training {args.steps} steps batch={args.batch} mode={mode_tag}',
+          flush=True)
     best_inf = 0.0
     t_start = time.time()
     for step in range(args.steps):
         model.train()
-        idx = torch.tensor(np.random.choice(N, args.batch, replace=False),
-                           device=device)
+        idx = torch.tensor(
+            np.random.choice(pool_size, args.batch, replace=False),
+            device=device)
         opt.zero_grad()
-        loss, _, _, _ = run_batch(idx)
+        loss, _, _, _ = batch_fn(idx)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(new_params, 1.0)
         opt.step(); sched.step()
@@ -326,9 +439,10 @@ def main():
             model.eval()
             with torch.no_grad():
                 eidx = torch.tensor(
-                    np.random.choice(N, min(512, N), replace=False),
+                    np.random.choice(pool_size, min(512, pool_size),
+                                     replace=False),
                     device=device)
-                _, pfc, fc, tot = run_batch(eidx)
+                _, pfc, fc, tot = batch_fn(eidx)
             pf = [c / max(tot, 1) for c in pfc]
             inf = fc / max(tot, 1)
             print(f'step {step:5d}  loss={loss.item():.4f}  inf={inf:.1%}  [' +
@@ -346,6 +460,7 @@ def main():
                         'inject_every': args.inject_every,
                         'adapter_mlp_ratio': args.adapter_mlp_ratio,
                         'max_instr_tokens': args.max_instr_tokens,
+                        'seq_window': W,
                         'chat_template': True,
                         'context_prefix': False,
                     },
@@ -359,6 +474,7 @@ def main():
             'inject_every': args.inject_every,
             'adapter_mlp_ratio': args.adapter_mlp_ratio,
             'max_instr_tokens': args.max_instr_tokens,
+            'seq_window': W,
         },
     }, args.ckpt.replace('.pt', '_final.pt'))
     print(f'done. best inf={best_inf:.1%}', flush=True)
