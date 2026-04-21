@@ -1,7 +1,7 @@
 [project]
 name = "reflex"
-version = "0.0.1"
-description = "Wire a frozen LLM to a CPU through cross-attention. No text generated — one RV32I instruction per cycle, conditioned on live machine state."
+version = "0.0.2"
+description = "Flamingo-SQL: grounded text-to-SQL via gated cross-attention. Frozen Qwen2.5-Coder backbone; DB state enters through cross-attn, not the prompt."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10,<3.13"
@@ -11,13 +11,13 @@ dependencies = [
     "rich>=13.7",
     "torch==2.4.1",
     "transformers>=4.45,<5",
-    "unicorn>=2.1",
+    "sentencepiece>=0.2",
 ]
 
 [project.scripts]
 train = "reflex.train:main"
-demo = "reflex.demo_tui:main"
 eval = "reflex.eval:main"
+infer = "reflex.inference:main"
 
 [build-system]
 requires = ["setuptools>=68"]

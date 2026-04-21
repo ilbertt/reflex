@@ -1,0 +1,6 @@
+accelerate>=0.30
+numpy>=1.26
+rich>=13.7
+torch==2.4.1
+transformers>=4.45,<5
+sentencepiece>=0.2
