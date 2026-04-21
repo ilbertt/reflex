@@ -32,8 +32,8 @@ class TrainConfig:
     out_dir: str = 'runs/flamingo_sql'
     backbone: str = 'Qwen/Qwen2.5-Coder-3B-Instruct'
     epochs: int = 2
-    batch_size: int = 2
-    grad_accum: int = 8
+    batch_size: int = 4
+    grad_accum: int = 4
     lr: float = 2e-4
     weight_decay: float = 0.0
     warmup_steps: int = 200
@@ -219,8 +219,8 @@ def main():
     ap.add_argument('--out-dir', default='runs/flamingo_sql')
     ap.add_argument('--backbone', default='Qwen/Qwen2.5-Coder-3B-Instruct')
     ap.add_argument('--epochs', type=int, default=2)
-    ap.add_argument('--batch-size', type=int, default=2)
-    ap.add_argument('--grad-accum', type=int, default=8)
+    ap.add_argument('--batch-size', type=int, default=4)
+    ap.add_argument('--grad-accum', type=int, default=4)
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()

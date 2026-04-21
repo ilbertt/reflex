@@ -40,7 +40,8 @@ class CrossAttnAdapter(nn.Module):
     adapter starts as an identity and the pretrained backbone is not
     disturbed at step 0."""
 
-    def __init__(self, dim: int, n_heads: int = 8, mlp_ratio: int = 4):
+    def __init__(self, dim: int, n_heads: int = 8, mlp_ratio: int = 4,
+                 init_gate: float = 0.5):
         super().__init__()
         self.norm_q = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
@@ -49,8 +50,19 @@ class CrossAttnAdapter(nn.Module):
             nn.Linear(dim, dim * mlp_ratio), nn.GELU(),
             nn.Linear(dim * mlp_ratio, dim),
         )
-        self.attn_gate = nn.Parameter(torch.zeros(1))
-        self.mlp_gate = nn.Parameter(torch.zeros(1))
+        # Canonical Flamingo inits gates at 0 (tanh=0 → identity at step
+        # 0). That fails here: the frozen Coder-3B can already produce
+        # plausible SQL from the question alone, so the gates get no
+        # gradient pressure to open and the adapters never engage the
+        # K/V channel. Initialise to ``atanh(init_gate)`` so cross-attn
+        # contributes meaningfully from step 1 and the model is forced
+        # to learn to exploit (or suppress) it.
+        g = float(init_gate)
+        assert -0.999 < g < 0.999, 'init_gate must be in (-1, 1)'
+        import math
+        raw = math.atanh(g)
+        self.attn_gate = nn.Parameter(torch.full((1,), raw))
+        self.mlp_gate = nn.Parameter(torch.full((1,), raw))
 
     def forward(self, hidden: torch.Tensor, kv: torch.Tensor,
                 kv_mask: torch.Tensor | None = None) -> torch.Tensor:
