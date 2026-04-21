@@ -158,17 +158,19 @@ class GroundedSQL(nn.Module):
                 labels: torch.Tensor | None = None,
                 use_cache: bool = False):
         self.set_state_kv(kv, kv_mask)
-        try:
-            out = self.backbone(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                use_cache=use_cache,
-                return_dict=True,
-            )
-        finally:
-            self.set_state_kv(None, None)
-        return out
+        # NOTE: we deliberately do NOT clear _current_kv after the forward
+        # pass. Gradient checkpointing on the backbone recomputes layer
+        # forwards during backward, and our hooks must still see the same
+        # kv they saw on the original forward. Callers overwrite via
+        # set_state_kv on the next forward; ``generate()`` wraps its own
+        # set/clear around ``backbone.generate``.
+        return self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            use_cache=use_cache,
+            return_dict=True,
+        )
 
 
 def build_backbone(backbone_id: str = BACKBONE_ID,
