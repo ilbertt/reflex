@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -59,11 +60,24 @@ def load_bird_split(root: str, split: str) -> list[BirdExample]:
         raw = json.load(f)
     out: list[BirdExample] = []
     skipped: set[str] = set()
+    malformed: set[str] = set()
+    healthy: dict[str, bool] = {}
     for r in raw:
         db_id = r['db_id']
         db_path = _find_db(db_root, db_id)
         if db_path is None:
             skipped.add(db_id)
+            continue
+        if db_id not in healthy:
+            try:
+                c = sqlite3.connect(db_path)
+                c.execute('SELECT name FROM sqlite_master LIMIT 1').fetchall()
+                c.close()
+                healthy[db_id] = True
+            except sqlite3.DatabaseError:
+                healthy[db_id] = False
+        if not healthy[db_id]:
+            malformed.add(db_id)
             continue
         out.append(BirdExample(
             question=r['question'],
@@ -72,10 +86,9 @@ def load_bird_split(root: str, split: str) -> list[BirdExample]:
             db_path=db_path,
             evidence=r.get('evidence', ''),
         ))
-    if skipped:
-        print(f'[data] skipped {len(raw)-len(out)} examples across '
-              f'{len(skipped)} db_ids without sqlite: '
-              f'{sorted(skipped)}')
+    if skipped or malformed:
+        print(f'[data] skipped {len(raw)-len(out)} examples. '
+              f'no_sqlite={sorted(skipped)}  malformed={sorted(malformed)}')
     return out
 
 
