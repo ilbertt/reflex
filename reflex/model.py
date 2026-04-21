@@ -148,7 +148,14 @@ class GroundedSQL(nn.Module):
                      kv_mask: torch.Tensor | None = None) -> None:
         """Set the database-state K/V used by every adapter on the next
         forward pass. Pass ``kv=None`` to disable cross-attention."""
-        self._current_kv = self.kv_norm(kv) if kv is not None else None
+        if kv is None:
+            self._current_kv = None
+        else:
+            # kv comes from the backbone's input embedding (often bf16)
+            # but kv_norm's params are fp32 by default; cast explicitly
+            # so eval-time generate (no autocast) works too.
+            kv = kv.to(self.kv_norm.weight.dtype)
+            self._current_kv = self.kv_norm(kv)
         self._current_kv_mask = kv_mask
 
     def forward(self, input_ids: torch.Tensor,
