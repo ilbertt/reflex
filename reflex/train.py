@@ -32,8 +32,8 @@ class TrainConfig:
     out_dir: str = 'runs/flamingo_sql'
     backbone: str = 'Qwen/Qwen2.5-Coder-3B-Instruct'
     epochs: int = 2
-    batch_size: int = 4
-    grad_accum: int = 4
+    batch_size: int = 2
+    grad_accum: int = 8
     lr: float = 2e-4
     weight_decay: float = 0.0
     warmup_steps: int = 200
@@ -43,7 +43,7 @@ class TrainConfig:
     sample_rows: int = DEFAULT_SAMPLE_ROWS
     seed: int = 0
     log_every: int = 20
-    save_every: int = 2000
+    save_every: int = 200
     adapter_checkpointing: bool = True
 
 
@@ -135,6 +135,14 @@ def train(cfg: TrainConfig):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     backbone, tok, hidden = build_backbone(cfg.backbone)
     backbone.to(device)
+    # Activation checkpointing on the frozen backbone — gradients still
+    # need to flow back through its layers to reach each adapter, so
+    # activations are the main memory cost even with frozen weights.
+    if hasattr(backbone, 'gradient_checkpointing_enable'):
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={'use_reentrant': False})
+    if hasattr(backbone, 'config'):
+        backbone.config.use_cache = False
     model = GroundedSQL(backbone, hidden=hidden, freeze_backbone=True)
     model.adapter_checkpointing = cfg.adapter_checkpointing
     model.to(device)
@@ -211,8 +219,8 @@ def main():
     ap.add_argument('--out-dir', default='runs/flamingo_sql')
     ap.add_argument('--backbone', default='Qwen/Qwen2.5-Coder-3B-Instruct')
     ap.add_argument('--epochs', type=int, default=2)
-    ap.add_argument('--batch-size', type=int, default=4)
-    ap.add_argument('--grad-accum', type=int, default=4)
+    ap.add_argument('--batch-size', type=int, default=2)
+    ap.add_argument('--grad-accum', type=int, default=8)
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
