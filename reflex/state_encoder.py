@@ -138,8 +138,14 @@ class StateEncoder(nn.Module):
                ) -> tuple[torch.Tensor, torch.Tensor]:
         """blocks_per_example: outer list is batch, inner list is the
         state blocks (one per table or query result). Returns
-        (kv, kv_mask) with shapes [B, T, H] and [B, T]."""
-        device = device or self.embed.weight.device
+        (kv, kv_mask) with shapes [B, T, H] and [B, T].
+
+        Token ids and the returned tensors always live on the embedding
+        weight's device, because ``self.embed`` itself is not moved
+        between devices. The caller may subsequently ``.to(...)`` the
+        result to transport it elsewhere.
+        """
+        device = self.embed.weight.device
         batch_ids: list[list[int]] = []
         for blocks in blocks_per_example:
             ids: list[int] = []
