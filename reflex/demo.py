@@ -66,11 +66,12 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
     emitted: list[int] = []
     halted = False
     err = ''
+    prev_hidden: torch.Tensor | None = None
     for cycle in range(max_cycles):
         pc = cpu.pc
         state = extract_state(cpu)
         state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
-        logits = model(ids, amask, state_t)
+        logits, prev_hidden = model(ids, amask, state_t, prev_hidden)
         bits = (logits > 0).long().squeeze(0).tolist()
         instr_w = 0
         for i, b in enumerate(bits):
