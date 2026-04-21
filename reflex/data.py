@@ -34,7 +34,7 @@ class BirdExample:
     evidence: str = ''
 
 
-def _find_db(db_root: Path, db_id: str) -> str:
+def _find_db(db_root: Path, db_id: str) -> str | None:
     # BIRD: <db_root>/<db_id>/<db_id>.sqlite
     p = db_root / db_id / f'{db_id}.sqlite'
     if p.exists():
@@ -42,7 +42,7 @@ def _find_db(db_root: Path, db_id: str) -> str:
     # fallback: any .sqlite under the db_id dir
     for cand in (db_root / db_id).glob('*.sqlite'):
         return str(cand)
-    raise FileNotFoundError(f'No sqlite for db_id={db_id} under {db_root}')
+    return None
 
 
 def load_bird_split(root: str, split: str) -> list[BirdExample]:
@@ -58,15 +58,24 @@ def load_bird_split(root: str, split: str) -> list[BirdExample]:
     with open(json_path, 'r') as f:
         raw = json.load(f)
     out: list[BirdExample] = []
+    skipped: set[str] = set()
     for r in raw:
         db_id = r['db_id']
+        db_path = _find_db(db_root, db_id)
+        if db_path is None:
+            skipped.add(db_id)
+            continue
         out.append(BirdExample(
             question=r['question'],
             sql=r.get('SQL') or r.get('query') or '',
             db_id=db_id,
-            db_path=_find_db(db_root, db_id),
+            db_path=db_path,
             evidence=r.get('evidence', ''),
         ))
+    if skipped:
+        print(f'[data] skipped {len(raw)-len(out)} examples across '
+              f'{len(skipped)} db_ids without sqlite: '
+              f'{sorted(skipped)}')
     return out
 
 
