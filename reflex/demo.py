@@ -9,7 +9,7 @@ import os
 import torch
 
 from .model import (
-    INJECT_EVERY, MAX_INSTR_TOKENS, GroundedReflex, build_backbone,
+    EMBED_DIM, INJECT_EVERY, MAX_INSTR_TOKENS, GroundedReflex, build_backbone,
     code_region_halt_fill, extract_state, render_prompt,
 )
 from .programs import SRC_OFFSET
@@ -31,8 +31,10 @@ def load(ckpt_path: str, device: str = 'cuda'):
     bb = bb.to(device)
     model = GroundedReflex(
         bb, cfg['hidden'],
+        num_instrs=cfg['num_instrs'],
         inject_every=cfg.get('inject_every', INJECT_EVERY),
         adapter_mlp_ratio=cfg.get('adapter_mlp_ratio', 2),
+        embed_dim=cfg.get('embed_dim', EMBED_DIM),
         freeze_backbone=True).to(device)
     model.load_state_dict(ckpt['state'], strict=False)
     model.eval()
@@ -70,11 +72,8 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
         pc = cpu.pc
         state = extract_state(cpu)
         state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
-        logits = model(ids, amask, state_t)
-        bits = (logits > 0).long().squeeze(0).tolist()
-        instr_w = 0
-        for i, b in enumerate(bits):
-            instr_w |= (int(b) & 1) << i
+        pred = model(ids, amask, state_t)
+        instr_w = int(model.decode_words(pred).item()) & 0xFFFFFFFF
         emitted.append(instr_w)
         if verbose:
             print(f'  cyc {cycle:3d}  pc=0x{pc:04X}  {instr_w:08X}')

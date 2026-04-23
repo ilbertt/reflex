@@ -174,14 +174,11 @@ def reflex_worker(state: DemoState, model, tok, device, max_instr_tokens=96,
             st_t = torch.from_numpy(st.astype('int64')).unsqueeze(0).to(device)
             if REFLEX_STREAM is not None:
                 with torch.cuda.stream(REFLEX_STREAM):
-                    logits = model(ids, amask, st_t)
+                    pred = model(ids, amask, st_t)
                 REFLEX_STREAM.synchronize()       # needed before CPU reads
             else:
-                logits = model(ids, amask, st_t)
-            bits = (logits > 0).long().squeeze(0).tolist()
-            w = 0
-            for i, b in enumerate(bits):
-                w |= (int(b) & 1) << i
+                pred = model(ids, amask, st_t)
+            w = int(model.decode_words(pred).item()) & 0xFFFFFFFF
 
             state.reflex_ops.append((global_cyc, pc, w, disasm(w)))
             state.reflex_op_count = global_cyc + 1
