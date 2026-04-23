@@ -7,15 +7,13 @@ pre-loaded. At each cycle we record the live state (before the step)
 and the ground-truth instruction at PC, then write that instruction and
 step. The translation cache is invalidated after every write.
 
-Training: the previous emitted instruction is already visible to the
-model through the memory window in the state vector, so there is no
-autoregressive head — we flatten the collected per-cycle (instruction,
-state, target) triples into a pool and train with uniform random
-mini-batches against the 32 independent instruction-bit heads. The
-backbone is frozen; only the state encoder, cross-attn adapters, and
-head train. Mixed bf16 autocast, standard AdamW, field-weighted BCE
-(rs2 bits × 3 to counter polysemy). Default config tuned to fit
-Qwen2.5-Coder-7B-Instruct on A100 80GB at batch=64.
+Training: the previous emitted instruction is visible through the
+memory window in the state vector, so there is no autoregressive head.
+We flatten the collected per-cycle triples into a pool, map each
+target word to its row in the unique-instruction table, and train the
+JEPA head with InfoNCE (cosine-sim logits over every row of the
+table). The backbone is frozen; only the state encoder, cross-attn
+adapters, head, and instruction-embedding table train.
 
 Usage:
     uv run train
@@ -33,7 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import (
-    BACKBONE_ID, FIELD_NAMES, N_INSTR_BITS, GroundedReflex, build_backbone,
+    BACKBONE_ID, EMBED_DIM, GroundedReflex, build_backbone,
     code_region_halt_fill, extract_state, render_prompt,
 )
 from .programs import SRC_OFFSET, load_tasks
@@ -100,6 +98,13 @@ def main():
                     'layers. Default 4 → 9 adapters on a 36-layer backbone.')
     ap.add_argument('--adapter-mlp-ratio', type=int, default=4)
     ap.add_argument('--max-instr-tokens', type=int, default=96)
+    ap.add_argument('--embed-dim', type=int, default=EMBED_DIM,
+                    help='Dimension of the JEPA instruction embedding.')
+    ap.add_argument('--nce-temp', type=float, default=0.07,
+                    help='InfoNCE temperature (cosine-sim / τ).')
+    ap.add_argument('--save-every', type=int, default=0,
+                    help='Also save a step-tagged ckpt every N steps '
+                    '(0 disables). Independent of the rolling-best save.')
     ap.add_argument('--sample-pool', type=int, default=300_000,
                     help='Subsample the flat cycle pool to this size, '
                     'balanced across families. 0 disables.')
@@ -187,23 +192,31 @@ def main():
               f'→ pool size = {len(flat_instr)}', flush=True)
     N = len(flat_instr)
 
-    # 32-bit instruction → LSB-first bit vector.
+    # Build the JEPA instruction table: one row per unique 32-bit word
+    # seen anywhere in the flattened cycle pool.
     words = np.array(flat_word, dtype=np.uint32)
-    bits = np.zeros((N, N_INSTR_BITS), dtype=np.float32)
-    for i in range(N_INSTR_BITS):
-        bits[:, i] = ((words >> i) & 1).astype(np.float32)
+    unique_words, target_idx = np.unique(words, return_inverse=True)
+    num_instrs = len(unique_words)
+    print(f'unique instruction words in training pool: {num_instrs}',
+          flush=True)
 
     INSTR_IDX_d = torch.from_numpy(np.array(flat_instr, dtype=np.int64)).to(device)
     STATE_d = torch.from_numpy(np.stack(flat_state)).to(device)
-    BITS_d = torch.from_numpy(bits).to(device)
+    TARGET_d = torch.from_numpy(target_idx.astype(np.int64)).to(device)
     INSTR_IDS_d = enc.input_ids.to(device)
     INSTR_MASK_d = enc.attention_mask.to(device)
 
     # ── Model ──
     model = GroundedReflex(backbone, HIDDEN,
+                           num_instrs=num_instrs,
                            inject_every=args.inject_every,
                            freeze_backbone=True,
-                           adapter_mlp_ratio=args.adapter_mlp_ratio).to(device)
+                           adapter_mlp_ratio=args.adapter_mlp_ratio,
+                           embed_dim=args.embed_dim).to(device)
+    # Seed the decode buffer so nearest-neighbour → real 32-bit word.
+    with torch.no_grad():
+        model.instr_words.copy_(
+            torch.from_numpy(unique_words.astype(np.int64)).to(device))
     backbone.eval()
 
     if args.resume:
@@ -243,36 +256,30 @@ def main():
         return {k: v for k, v in full.items()
                 if k in keep or not k.startswith('backbone.')}
 
-    FIELD_BIT_SLICES = (
-        (0, 7), (7, 12), (12, 15), (15, 20), (20, 25), (25, 32),
-    )
-
-    # Field-weighted BCE. rs2 (bits 20-24) is polysemous (register on R-type
-    # but imm[4:0] on I/U/J-type) and consistently plateaus at ~0.89 while
-    # every other field converges to 1.00. Weighting its 5 bits at 3×
-    # roughly doubles rs2's gradient share (15/42 ≈ 36% vs 15.6% uniform),
-    # so it stops being drowned out by the already-solved bits.
-    bit_weights = torch.ones(N_INSTR_BITS, device=device)
-    bit_weights[20:25] = 5.0
+    tau = args.nce_temp
 
     def run_batch(idx):
         B = len(idx)
         state = STATE_d[idx]
-        tgts = BITS_d[idx]
+        tgts = TARGET_d[idx]
         ii = INSTR_IDX_d[idx]
         ids = INSTR_IDS_d[ii]
         mask = INSTR_MASK_d[ii]
         with torch.autocast('cuda', dtype=torch.bfloat16,
                             enabled=(device == 'cuda')):
-            logits = model(ids, mask, state)
-        loss = F.binary_cross_entropy_with_logits(
-            logits.float(), tgts, weight=bit_weights)
-        pred_bits = (logits > 0).long()
-        bit_ok = (pred_bits == tgts.long())
-        pfc = [bit_ok[:, lo:hi].all(dim=1).float().sum().item()
-               for lo, hi in FIELD_BIT_SLICES]
-        fc = bit_ok.all(dim=1).float().sum().item()
-        return loss, pfc, fc, B
+            pred = model(ids, mask, state)
+        # InfoNCE over the full instruction codebook. Cosine similarity
+        # puts pred and every row on the unit sphere; temperature τ
+        # sharpens the contrast.
+        sim = model.table_similarity(pred) / tau           # [B, num_instrs]
+        loss = F.cross_entropy(sim, tgts)
+        pred_idx = sim.argmax(dim=-1)
+        top1 = (pred_idx == tgts).float().sum().item()
+        top5 = 0.0
+        if sim.size(1) >= 5:
+            top5 = (sim.topk(5, dim=-1).indices ==
+                    tgts.unsqueeze(1)).any(dim=-1).float().sum().item()
+        return loss, top1, top5, B
 
     # Optional end-to-end probe. Format: "prompt=value" or "prompt@0xADDR=value".
     probe_prompt = probe_expected = probe_addr = None
@@ -299,8 +306,22 @@ def main():
         print(f'  probe {mark} ops={len(emitted)} halted={halted} '
               f'mem[0x{probe_addr:x}]={got} (want {probe_expected})', flush=True)
 
-    print(f'training {args.steps} steps batch={args.batch}', flush=True)
-    best_inf = 0.0
+    def ckpt_config():
+        return {
+            'backbone_id': args.backbone_id,
+            'hidden': HIDDEN,
+            'inject_every': args.inject_every,
+            'adapter_mlp_ratio': args.adapter_mlp_ratio,
+            'max_instr_tokens': args.max_instr_tokens,
+            'embed_dim': args.embed_dim,
+            'num_instrs': num_instrs,
+            'chat_template': True,
+            'context_prefix': False,
+        }
+
+    print(f'training {args.steps} steps batch={args.batch}  '
+          f'table={num_instrs}  embed_dim={args.embed_dim}', flush=True)
+    best_top1 = 0.0
     t_start = time.time()
     for step in range(args.steps):
         model.train()
@@ -312,52 +333,44 @@ def main():
         torch.nn.utils.clip_grad_norm_(new_params, 1.0)
         opt.step(); sched.step()
 
-        # Fast tick: just the training-batch loss (no extra forward needed).
         if step % 50 == 0 and step % 500 != 0:
             print(f'step {step:5d}  loss={loss.item():.4f}  '
                   f'{time.time()-t_start:.0f}s', flush=True)
 
-        # Full eval tick: 512-sample forward for field metrics + probe + ckpt.
+        # Full eval tick: 512-sample forward + probe + ckpt.
         if step % 500 == 0:
             model.eval()
             with torch.no_grad():
                 eidx = torch.tensor(
                     np.random.choice(N, min(512, N), replace=False),
                     device=device)
-                _, pfc, fc, tot = run_batch(eidx)
-            pf = [c / max(tot, 1) for c in pfc]
-            inf = fc / max(tot, 1)
-            print(f'step {step:5d}  loss={loss.item():.4f}  inf={inf:.1%}  [' +
-                  ' '.join(f"{n}:{a:.2f}" for n, a in zip(FIELD_NAMES, pf)) +
-                  f']  {time.time()-t_start:.0f}s', flush=True)
+                _, top1, top5, tot = run_batch(eidx)
+            a1 = top1 / max(tot, 1)
+            a5 = top5 / max(tot, 1)
+            print(f'step {step:5d}  loss={loss.item():.4f}  '
+                  f'top1={a1:.1%}  top5={a5:.1%}  '
+                  f'{time.time()-t_start:.0f}s', flush=True)
             if probe_prompt is not None:
                 do_probe()
-            if inf > best_inf and step > 0:
-                best_inf = inf
-                torch.save({
-                    'state': trainable_state_dict(),
-                    'config': {
-                        'backbone_id': args.backbone_id,
-                        'hidden': HIDDEN,
-                        'inject_every': args.inject_every,
-                        'adapter_mlp_ratio': args.adapter_mlp_ratio,
-                        'max_instr_tokens': args.max_instr_tokens,
-                        'chat_template': True,
-                        'context_prefix': False,
-                    },
-                }, args.ckpt)
+            if a1 > best_top1 and step > 0:
+                best_top1 = a1
+                torch.save({'state': trainable_state_dict(),
+                            'config': ckpt_config()}, args.ckpt)
 
-    torch.save({
-        'state': trainable_state_dict(),
-        'config': {
-            'backbone_id': args.backbone_id,
-            'hidden': HIDDEN,
-            'inject_every': args.inject_every,
-            'adapter_mlp_ratio': args.adapter_mlp_ratio,
-            'max_instr_tokens': args.max_instr_tokens,
-        },
-    }, args.ckpt.replace('.pt', '_final.pt'))
-    print(f'done. best inf={best_inf:.1%}', flush=True)
+        # Periodic step-tagged save alongside the rolling-best save.
+        # Tag by absolute step so resumed runs extend the series instead
+        # of overwriting tags from prior runs.
+        if args.save_every and step > 0 and step % args.save_every == 0:
+            abs_step = step + args.init_step
+            tagged = args.ckpt.replace('.pt', f'_step{abs_step}.pt')
+            torch.save({'state': trainable_state_dict(),
+                        'config': ckpt_config()}, tagged)
+            print(f'  [saved {tagged}]', flush=True)
+
+    torch.save({'state': trainable_state_dict(),
+                'config': ckpt_config()},
+               args.ckpt.replace('.pt', '_final.pt'))
+    print(f'done. best top1={best_top1:.1%}', flush=True)
 
 
 if __name__ == '__main__':

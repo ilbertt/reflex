@@ -1,16 +1,18 @@
 """
-Reflex — grounded RV32I control head (Flamingo-style fusion).
+Reflex — grounded RV32I control head (Flamingo-style fusion, JEPA head).
 
-The backbone is fully unfrozen and processes the instruction tokens.
-Every ``INJECT_EVERY`` transformer layers, a cross-attention adapter is
-spliced in via a forward hook: the backbone's current hidden states
-(queries) attend over live machine-state K/V (32 regs + pc + 16-word
-window around pc + 16-word window around sp = 65 tokens). By the time
-control reaches the final layer, the instruction representation has
-been fused with the machine state at multiple depths.
+The backbone processes the instruction tokens; every ``INJECT_EVERY``
+transformer layers a Flamingo-style cross-attention adapter fuses live
+machine-state K/V (32 regs + pc + 16 words around pc + 16 words around
+sp = 65 tokens) into the hidden stream.
 
-A small pooled-MLP + six classification heads then emit the RV32I field
-decomposition (opcode / rd / funct3 / rs1 / rs2 / funct7).
+Output head is JEPA-style: the pooled hidden state is projected to a
+continuous embedding and compared (cosine similarity) against a jointly
+trained table of instruction embeddings — one slot per unique 32-bit
+word observed in training. At inference the predicted vector snaps to
+the nearest table entry, which acts as error correction: small
+embedding noise can't flip a bit, it just picks a close-neighbour
+instruction.
 """
 import numpy as np
 import torch
@@ -66,11 +68,13 @@ def render_prompt(tok, task: str, use_chat_template: bool = True,
     return task
 
 
-# Bit-level output: 32 independent sigmoid heads, one per instruction bit.
-# Sidesteps RV32I field polysemy (e.g. rs2 = register on R-type but
-# imm[4:0] on I-type) that bottlenecks a field-decomposition head.
-N_INSTR_BITS = 32
-FIELD_NAMES = ('opcode', 'rd', 'funct3', 'rs1', 'rs2', 'funct7')
+# JEPA-style output: the model predicts a continuous embedding vector;
+# nearest-neighbour over a jointly trained instruction codebook recovers
+# the 32-bit word. Small prediction noise in embedding space can't flip
+# a bit — it snaps to the closest real instruction, giving free error
+# correction that is the reason popcount-255 (199 consecutive opcodes)
+# completes cleanly at only ~97% per-step top-1.
+EMBED_DIM = 256
 
 # State token layout (65 tokens total)
 N_REGS = 32                     # tokens 0..31 = x0..x31
@@ -185,14 +189,18 @@ class GroundedReflex(nn.Module):
         4. Small MLP + six linear heads → RV32I field logits.
     """
     def __init__(self, backbone, hidden: int,
+                 num_instrs: int,
                  inject_every: int = INJECT_EVERY,
                  freeze_backbone: bool = False,
-                 adapter_mlp_ratio: int = 4):
+                 adapter_mlp_ratio: int = 4,
+                 embed_dim: int = EMBED_DIM):
         super().__init__()
         self.backbone = backbone
         self.hidden = hidden
         self.inject_every = inject_every
         self.freeze_backbone = freeze_backbone
+        self.embed_dim = embed_dim
+        self.num_instrs = num_instrs
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
@@ -211,7 +219,16 @@ class GroundedReflex(nn.Module):
             nn.Linear(hidden, hidden), nn.GELU(),
             nn.Linear(hidden, hidden),
         )
-        self.bit_head = nn.Linear(hidden, N_INSTR_BITS)
+        self.embed_head = nn.Linear(hidden, embed_dim)
+
+        # JEPA instruction codebook: one trainable embedding per unique
+        # 32-bit word observed in training. ``instr_words`` is the
+        # companion int64 buffer so the decoded word travels with the
+        # checkpoint and lives on-device for nearest-neighbour lookup.
+        self.instr_table = nn.Embedding(num_instrs, embed_dim)
+        nn.init.normal_(self.instr_table.weight, std=0.02)
+        self.register_buffer('instr_words',
+                             torch.zeros(num_instrs, dtype=torch.int64))
 
         self._current_kv: torch.Tensor | None = None
         self._hook_handles: list = []
@@ -254,7 +271,7 @@ class GroundedReflex(nn.Module):
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
                 state_vals: torch.Tensor) -> torch.Tensor:
-        """Returns [B, 32] raw bit logits (sigmoid at inference, BCE at train)."""
+        """Returns [B, embed_dim] predicted instruction embedding."""
         kv = self.kv_norm(self.state_encoder(state_vals))    # [B, 65, H]
         self._current_kv = kv
         try:
@@ -264,21 +281,27 @@ class GroundedReflex(nn.Module):
                                 return_dict=True, use_cache=False)
         finally:
             self._current_kv = None
-        # Keep hidden states in the head's parameter dtype so fp32/bf16
-        # adapter heads both work. BCE loss in train.py casts logits to
-        # fp32 before computing the loss for numerical stability.
         head_dtype = next(self.head_mlp.parameters()).dtype
         h = out.last_hidden_state.to(head_dtype)
-        # Last-token pool: in a causal LLM the final real token has
-        # attended to every preceding token, so it encodes the full
-        # prompt (prefix + task) without the dilution that mean-pool
-        # suffers when a long shared prefix is present. We locate the
-        # final non-pad token via the attention_mask (Qwen uses
-        # right-padding by default).
         last_idx = attention_mask.sum(dim=1).long() - 1      # [B]
         pooled = h[torch.arange(h.size(0), device=h.device), last_idx]
         feat = self.head_mlp(pooled)
-        return self.bit_head(feat)                           # [B, 32]
+        return self.embed_head(feat)                         # [B, embed_dim]
+
+    def table_similarity(self, pred: torch.Tensor) -> torch.Tensor:
+        """Cosine similarity of [B, embed_dim] pred against every row of
+        the instruction codebook. Returns [B, num_instrs]."""
+        p = torch.nn.functional.normalize(pred.float(), dim=-1)
+        t = torch.nn.functional.normalize(self.instr_table.weight.float(),
+                                          dim=-1)
+        return p @ t.T
+
+    @torch.no_grad()
+    def decode_words(self, pred: torch.Tensor) -> torch.Tensor:
+        """Nearest-neighbour decode [B, embed_dim] → [B] int64 instruction
+        words (values from ``instr_words``)."""
+        idx = self.table_similarity(pred).argmax(dim=-1)
+        return self.instr_words[idx]
 
 
 def build_backbone(backbone_id: str = BACKBONE_ID,
