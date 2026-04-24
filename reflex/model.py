@@ -246,14 +246,26 @@ class TargetAwareHead(nn.Module):
         hidden-state output ([B, T, H]). ``attention_mask`` is the
         standard HF mask where 1 is a real token, 0 is padding.
         """
-        kv = self.prompt_norm(prompt_hidden)                 # [B, T, H]
-        q = self.q_proj(pooled).unsqueeze(1)                 # [B, 1, H]
+        # Cast inputs to the head's parameter dtype. This lets the
+        # head hold its own weights in fp32 (the initial state after
+        # `nn.Linear(...)` / `nn.LayerNorm(...)` construction) while
+        # still accepting bf16 inputs from the upstream backbone
+        # forward. The result is cast back to the input dtype so
+        # downstream ``head_mlp`` receives the expected precision.
+        in_dtype = pooled.dtype
+        p_dtype = self.prompt_norm.weight.dtype
+        pooled_p = pooled.to(p_dtype)
+        prompt_p = prompt_hidden.to(p_dtype)
+
+        kv = self.prompt_norm(prompt_p)                      # [B, T, H]
+        q = self.q_proj(pooled_p).unsqueeze(1)               # [B, 1, H]
         # key_padding_mask=True on positions to IGNORE.
         kpm = (attention_mask == 0)
         att, _ = self.xattn(q, kv, kv, key_padding_mask=kpm,
                             need_weights=False)
         delta = self.out_proj(att.squeeze(1))                # [B, H]
-        return pooled + torch.tanh(self.gate) * delta
+        refined = pooled_p + torch.tanh(self.gate) * delta
+        return refined.to(in_dtype)
 
 
 class CrossAttnAdapter(nn.Module):
@@ -400,15 +412,35 @@ class GroundedReflex(nn.Module):
         """Returns [B, embed_dim] predicted instruction embedding."""
         kv = self.kv_norm(self.state_encoder(state_vals))    # [B, 65, H]
         self._current_kv = kv
+        # When nothing upstream of the head-output is trainable
+        # (Path B retrain: adapters, state_encoder, kv_norm all
+        # frozen), run the backbone under ``torch.no_grad()`` so
+        # the transformer layers don't retain activations for a
+        # backward pass that never reaches them. Frees ~6 GB at
+        # batch 16 seq_len 96 on Qwen-7B and lets 24 GB 3090s fit.
+        no_grad_backbone = getattr(self, 'detach_backbone_output', False)
         try:
-            out = self.backbone(input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                output_hidden_states=False,
-                                return_dict=True, use_cache=False)
+            if no_grad_backbone:
+                with torch.no_grad():
+                    out = self.backbone(input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        output_hidden_states=False,
+                                        return_dict=True, use_cache=False)
+            else:
+                out = self.backbone(input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                    output_hidden_states=False,
+                                    return_dict=True, use_cache=False)
         finally:
             self._current_kv = None
         head_dtype = next(self.head_mlp.parameters()).dtype
         h = out.last_hidden_state.to(head_dtype)
+        # Ensure ``h`` is a leaf tensor with requires_grad flipped on
+        # so downstream trainable params (target_head, head_mlp, etc.)
+        # can still backprop through operations applied to h. The
+        # backbone's internal grad graph was already skipped above.
+        if no_grad_backbone:
+            h = h.detach().requires_grad_(True)
         last_idx = attention_mask.sum(dim=1).long() - 1      # [B]
         pooled = h[torch.arange(h.size(0), device=h.device), last_idx]
         if self.target_head is not None:

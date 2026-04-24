@@ -119,6 +119,12 @@ def main():
     ap.add_argument('--also-train-canonical-head', action='store_true',
                     help='With --freeze-except-target-head, also '
                     'unfreeze head_mlp + embed_head + instr_table.')
+    ap.add_argument('--also-train-head-mlp', action='store_true',
+                    help='With --freeze-except-target-head, unfreeze '
+                    'ONLY head_mlp (not embed_head / instr_table). '
+                    'Keeps the codebook geometry fixed so the target '
+                    'head learns a residual that head_mlp adapts to '
+                    'without shifting the codebook targets.')
     args = ap.parse_args()
     if args.freeze_except_target_head:
         args.use_target_head = True
@@ -245,6 +251,39 @@ def main():
               f'unexpected={len(unexpected)}', flush=True)
 
     if args.freeze_except_target_head:
+        # Path B retrain: cast every trainable + frozen module EXCEPT
+        # the backbone (already bf16) to bf16 so matmuls don't upcast
+        # to fp32 and blow up MLP intermediates. Without this, the
+        # adapters' and state_encoder's fp32-default weights cause
+        # the backbone's bf16 activations to round-trip through fp32
+        # inside the adapter MLP, allocating ~1-2 GB of temporaries
+        # per layer and OOM-ing at any batch size on a 24 GB 3090.
+        for name, p in list(model.named_parameters()):
+            if name.startswith('backbone.'):
+                continue
+            p.data = p.data.to(dtype=torch.bfloat16)
+        for name, b in list(model.named_buffers()):
+            if name.startswith('backbone.'):
+                continue
+            if b.dtype.is_floating_point:
+                b.data = b.data.to(dtype=torch.bfloat16)
+    if args.freeze_except_target_head:
+        # Path B only: backbone is already under no_grad in forward,
+        # but model.train() (called in the step loop) enables dropout
+        # and train-mode activations across the backbone. We want the
+        # backbone in eval mode to skip dropout activations entirely
+        # — the backbone is frozen, so train-mode randomness is noise
+        # that costs memory for no value. Also put the frozen
+        # adapters in eval mode so their MultiheadAttention dropout
+        # doesn't retain masks.
+        model.backbone.eval()
+        for ad in model.adapters:
+            ad.eval()
+        # ``state_encoder`` and ``kv_norm`` are small but put them in
+        # eval for consistency.
+        model.state_encoder.eval()
+        model.kv_norm.eval()
+    if args.freeze_except_target_head:
         # Freeze everything the canonical retrain normally leaves
         # trainable (adapters, state_encoder, kv_norm) so only the
         # target head's new cross-attention pathway trains. Optionally
@@ -261,10 +300,18 @@ def main():
             for mod_name in ('head_mlp', 'embed_head', 'instr_table'):
                 for p in getattr(model, mod_name).parameters():
                     p.requires_grad_(True)
+        elif args.also_train_head_mlp:
+            for p in model.head_mlp.parameters():
+                p.requires_grad_(True)
         frozen = sum(1 for p in model.parameters() if not p.requires_grad)
         trainable_cnt = sum(1 for p in model.parameters() if p.requires_grad)
         print(f'Path-B freeze applied: {trainable_cnt} trainable tensors, '
               f'{frozen} frozen', flush=True)
+        # Detach the backbone's hidden-state output before the head
+        # consumes it — with nothing upstream trainable, activations
+        # from the 28 backbone layers would otherwise be retained for
+        # a backward pass that never reaches them.
+        model.detach_backbone_output = True
 
     new_params = [p for p in model.parameters() if p.requires_grad]
     n_new = sum(p.numel() for p in new_params) / 1e6
@@ -301,9 +348,10 @@ def main():
         ii = INSTR_IDX_d[idx]
         ids = INSTR_IDS_d[ii]
         mask = INSTR_MASK_d[ii]
-        with torch.autocast('cuda', dtype=torch.bfloat16,
-                            enabled=(device == 'cuda')):
-            pred = model(ids, mask, state)
+        # Model + weights + inputs are already bf16; autocast would
+        # add fp32 shadow copies during forward, costing ~2 GB on a
+        # 24 GB 3090. Run without autocast.
+        pred = model(ids, mask, state)
         # InfoNCE over the full instruction codebook. Cosine similarity
         # puts pred and every row on the unit sphere; temperature τ
         # sharpens the contrast.
@@ -362,6 +410,15 @@ def main():
     t_start = time.time()
     for step in range(args.steps):
         model.train()
+        if args.freeze_except_target_head:
+            # Keep frozen modules in eval mode even after model.train().
+            # Skips dropout activation storage across the 28-layer
+            # backbone and the 7 cross-attn adapters.
+            model.backbone.eval()
+            for ad in model.adapters:
+                ad.eval()
+            model.state_encoder.eval()
+            model.kv_norm.eval()
         idx = torch.tensor(np.random.choice(N, args.batch, replace=False),
                            device=device)
         opt.zero_grad()

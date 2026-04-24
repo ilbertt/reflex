@@ -114,6 +114,31 @@ The `feat/latent-fidelity-testbed` branch is kept in the history because three f
 
 3. **LayerNorm discards magnitude; only direction survives.** `table_similarity` is cosine, so magnitude is discarded downstream by design. But the *pre-head pooled hidden state* still has magnitude information that the current head throws away. Any head-side fix that wants to use magnitude would need to preserve it before the final normalization.
 
+### A negative result on Path B retrain
+
+The Path-B head architecture (`TargetAwareHead` + prompt cross-attention) is implemented, wires cleanly into the canonical forward path with a tanh-zero-init gate, and trains stably on the cycle-pool corpus with the same InfoNCE loss as the canonical training. Per-cycle top-1 on a held-out split improves from 96.9% to 97.5–97.9% depending on the freeze configuration. **End-to-end task pass rate regresses in every configuration tested.**
+
+Three variants were run on the 3090:
+
+| freeze config (target_head always trainable) | steps | lr | per-cycle top-1 | 23-task pass |
+|---|---|---|---|---|
+| + head_mlp + embed_head + instr_table | 3000 | 5e-5 | 97.9% | 10/23 |
+| nothing else (target_head only) | 3000 | 5e-5 | 97.5% | 9/23 |
+| + head_mlp only (codebook frozen) | 2000 | 2e-5 | 97.7% | 3/11 (partial) |
+
+The failure mode is consistent across variants: short tasks that the canonical checkpoint emits in 5–8 ops now derail within the first few cycles. The target_head adds a non-zero residual to the pooled hidden state; even when the canonical head_mlp is included in training and allowed to adapt, InfoNCE's per-cycle gradient does not produce a head that preserves the multi-step execution behaviour. The per-cycle metric improvement masks what looks like a reshuffling of *which* cycles the model predicts correctly — gaining on some, losing on others — and the losses land on execution-critical cycles (register allocation setup, branch targets) whose wrongness cascades. The canonical checkpoint's 19/23 pass rate depends on a particular joint calibration between pooled, head_mlp, and the codebook that InfoNCE does not explicitly reward, so the retrain drifts away from it.
+
+What this tells us:
+
+1. The architecture is not the problem. `TargetAwareHead` attaches correctly and trains cleanly.
+2. The *training objective* is. Per-cycle InfoNCE treats every cycle as an independent classification problem and optimises a metric that does not penalise compounded errors. A cycle mis-predicted in step 3 of a 91-op factorial program costs InfoNCE one unit of loss but costs the task 100% of its output.
+3. A Path-B retrain that actually lifts end-to-end fidelity requires either:
+   - an end-to-end task-pass loss (Unicorn in the training loop; expensive but principled), or
+   - a much smaller effective-lr budget — e.g. 100 steps at lr 1e-6 so the gate barely opens and the added signal is a gentle nudge rather than a reshuffle, or
+   - training that includes the canonical run (use the canonical head at step 0 as the teacher; penalise KL divergence on the top-k across the cycle pool until the new head matches, then relax).
+
+The scaffolding (`TargetAwareHead`, `reflex/train.py --use-target-head / --freeze-except-target-head / --also-train-head-mlp / --also-train-canonical-head`) is shipped for future iteration. The three retrain checkpoints (`reflex_target_head.pt`, `reflex_target_head_only.pt`, `reflex_th_plus_headmlp.pt`) are retained at the repo root for reproducibility of this negative result; they are not deployable. The canonical `reflex.pt` plus `rd_consistency` (20/23, 87%) remains the best shipping configuration.
+
 ### A negative result on pred-norm as a second gate
 
 The latent-recurrence work predicted that the embed-head's linear bias would dominate on near-zero inputs, so `||pred||` should carry confidence signal independent of cosine margin. `scripts/jepa_norm_probe.py` measured this across the 23-task suite and found only partial support: the failing-cycle distribution's p90 `pred_norm` (85) is ~2× the passing-cycle p90 (38), but the discriminative mass lives almost entirely in one task — `sum 1..10` has mean `pred_norm` 32.78 while most programs hover at 16–24. The display-tier failures, the ones we were hoping to rescue, look normal on `pred_norm` (16–17). Magnitude signals prompt-misinterpretation ("the model is confidently computing the wrong thing"), not byte-disambiguation. A norm-based gate would help with `sum 1..10` if there were a rescue mechanism that didn't itself need target-intent; there isn't one at inference.
