@@ -114,6 +114,12 @@ The `feat/latent-fidelity-testbed` branch is kept in the history because three f
 
 3. **LayerNorm discards magnitude; only direction survives.** `table_similarity` is cosine, so magnitude is discarded downstream by design. But the *pre-head pooled hidden state* still has magnitude information that the current head throws away. Any head-side fix that wants to use magnitude would need to preserve it before the final normalization.
 
+### A negative result on pred-norm as a second gate
+
+The latent-recurrence work predicted that the embed-head's linear bias would dominate on near-zero inputs, so `||pred||` should carry confidence signal independent of cosine margin. `scripts/jepa_norm_probe.py` measured this across the 23-task suite and found only partial support: the failing-cycle distribution's p90 `pred_norm` (85) is ~2× the passing-cycle p90 (38), but the discriminative mass lives almost entirely in one task — `sum 1..10` has mean `pred_norm` 32.78 while most programs hover at 16–24. The display-tier failures, the ones we were hoping to rescue, look normal on `pred_norm` (16–17). Magnitude signals prompt-misinterpretation ("the model is confidently computing the wrong thing"), not byte-disambiguation. A norm-based gate would help with `sum 1..10` if there were a rescue mechanism that didn't itself need target-intent; there isn't one at inference.
+
+Recorded as a dead-end because it refines the picture: for byte-ambiguity failures the ceiling really is the one argued in `HEAD_STUDY.md`, not a missing easy gate.
+
 ### A negative result worth recording
 
 An earlier experiment (`scripts/jepa_lookahead_infer.py`) used the model's own next-cycle margin as the score for each candidate fork. This regressed from 19/23 to 11/23 — decisively worse than baseline. The lesson matches the literature's prediction: the model's self-confidence about the next step is maximized by picking paths where the next step is trivially determined, which is not the same as picking paths that are semantically correct. When the scoring signal is derived from the same model whose uncertainty you are trying to resolve, the circularity is structural. This is the finding that pushed us to build `exec_verify.py` (oracle-backed) rather than a purely model-driven re-rank.
