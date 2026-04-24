@@ -44,8 +44,13 @@ def predict_topk(model, ids: torch.Tensor, amask: torch.Tensor,
     """One model forward at the current CPU state. Returns
     ``(top_words, top_sims)`` where ``top_words`` is a list of int 32-bit
     words and ``top_sims`` is a list of cosine similarities, both sorted
-    descending by similarity."""
-    state = extract_state(cpu)
+    descending by similarity.
+
+    Reads ``model.use_progress_state`` to decide whether to ask
+    ``extract_state`` for the 68-token enriched vector or the canonical
+    65-token vector. Un-retrained checkpoints stay on 65."""
+    enriched = bool(getattr(model, 'use_progress_state', False))
+    state = extract_state(cpu, enriched=enriched)
     state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
     pred = model(ids, amask, state_t)
     sims = model.table_similarity(pred).squeeze(0)

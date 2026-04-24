@@ -36,6 +36,7 @@ def load(ckpt_path: str, device: str = 'cuda'):
         adapter_mlp_ratio=cfg.get('adapter_mlp_ratio', 2),
         embed_dim=cfg.get('embed_dim', EMBED_DIM),
         use_target_head=cfg.get('use_target_head', False),
+        use_progress_state=cfg.get('use_progress_state', False),
         freeze_backbone=True).to(device)
     model.load_state_dict(ckpt['state'], strict=False)
     model.eval()
@@ -95,9 +96,12 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
     emitted: list[int] = []
     halted = False
     err = ''
+    # Path D: when the loaded model was built with progress-state
+    # enrichment, the state encoder expects 68 tokens instead of 65.
+    enriched = bool(getattr(model, 'use_progress_state', False))
     for cycle in range(max_cycles):
         pc = cpu.pc
-        state = extract_state(cpu)
+        state = extract_state(cpu, enriched=enriched)
         state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
         pred = model(ids, amask, state_t)
         instr_w = int(model.decode_words(pred).item()) & 0xFFFFFFFF

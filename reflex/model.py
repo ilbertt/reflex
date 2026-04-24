@@ -76,13 +76,28 @@ def render_prompt(tok, task: str, use_chat_template: bool = True,
 # completes cleanly at only ~97% per-step top-1.
 EMBED_DIM = 256
 
-# State token layout (65 tokens total)
+# State token layout (65 tokens total in the canonical encoder)
 N_REGS = 32                     # tokens 0..31 = x0..x31
 IDX_PC = 32                     # token 32     = pc
 IDX_MEM_PC = 33                 # tokens 33..48 = 16 words around pc
 IDX_MEM_SP = 49                 # tokens 49..64 = 16 words around sp
 N_STATE_TOKENS = 65
 MEM_WINDOW_WORDS = 16
+
+# Path D (HEAD_STUDY.md) progress tokens — appended to the 65-token
+# canonical state when ``use_progress_state`` is enabled. Each slot is
+# a single uint32 carrying a monotone counter:
+#   slot 0  bytes_written_to_display  (count of nonzero bytes in 0x6000..0x6100)
+#   slot 1  words_written_to_data     (count of nonzero words in 0x5000..0x5100)
+#   slot 2  cycles_since_last_store   (0 on the cycle after a STORE; ramps)
+# Programs that write byte sequences to the display or data regions
+# produce a recognisable trajectory in these slots — the missing
+# "sequence-position" signal the display-tier failures need.
+N_PROGRESS_TOKENS = 3
+N_STATE_TOKENS_ENRICHED = N_STATE_TOKENS + N_PROGRESS_TOKENS
+IDX_PROGRESS_DISPLAY = N_STATE_TOKENS + 0
+IDX_PROGRESS_DATA    = N_STATE_TOKENS + 1
+IDX_PROGRESS_STORE   = N_STATE_TOKENS + 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -106,14 +121,50 @@ def _safe_read_words(cpu: Rv32i, center: int,
     return out
 
 
-def extract_state(cpu: Rv32i) -> np.ndarray:
-    """Returns a [65] uint32 state vector for the given Rv32i instance."""
+def extract_state(cpu: Rv32i, *,
+                  enriched: bool = False) -> np.ndarray:
+    """Returns a state vector for the given Rv32i instance.
+
+    If ``enriched=False`` (default — canonical checkpoint behaviour):
+        [65] uint32 vector as documented in the README.
+    If ``enriched=True`` (Path D retrain):
+        [68] uint32 vector = canonical 65 + 3 progress tokens. The
+        progress tokens are computed from CPU memory regions (no
+        history tracking required): display-byte count, data-word
+        count, and a synthetic "cycles since last store" slot that the
+        caller must maintain. When called without history, slot 2 is
+        set to 0 (treat as "just-after-store"); training and inference
+        loops should thread a counter through calls.
+    """
     regs = [cpu.reg(i) for i in range(N_REGS)]
     pc = cpu.pc
     sp = cpu.reg(2)                          # x2 = sp by ABI
     mem_pc = _safe_read_words(cpu, pc)
     mem_sp = _safe_read_words(cpu, sp)
-    return np.array(regs + [pc] + mem_pc + mem_sp, dtype=np.uint32)
+    base = regs + [pc] + mem_pc + mem_sp
+    if not enriched:
+        return np.array(base, dtype=np.uint32)
+
+    from .programs import DISPLAY_BASE
+    # Count nonzero bytes in the first 256 bytes of DISPLAY.
+    bytes_written = 0
+    try:
+        buf = bytes(cpu.uc.mem_read(DISPLAY_BASE, 256))
+        bytes_written = sum(1 for b in buf if b != 0)
+    except Exception:
+        pass
+    # Count nonzero words in the first 64 words of DATA.
+    data_words = 0
+    try:
+        buf = bytes(cpu.uc.mem_read(DATA_BASE, 256))
+        for i in range(0, 256, 4):
+            if int.from_bytes(buf[i:i+4], 'little') != 0:
+                data_words += 1
+    except Exception:
+        pass
+    # slot 2 left at 0; caller supplies via a separate path if needed.
+    progress = [bytes_written, data_words, 0]
+    return np.array(base + progress, dtype=np.uint32)
 
 
 # ── Modules ───────────────────────────────────────────────────────────
@@ -126,6 +177,12 @@ class StateEncoder(nn.Module):
     """
     def __init__(self, hidden: int, n_tokens: int = N_STATE_TOKENS,
                  byte_dim: int = 32):
+        """``n_tokens`` controls the K/V sequence length. 65 is the
+        canonical configuration. Set to 68 (``N_STATE_TOKENS_ENRICHED``)
+        when building a Path-D model that uses the progress-token
+        extension — the extra three slots share the same role-embedding
+        + value-projection machinery and initialise to random weights
+        just like the canonical tokens; retraining teaches them."""
         super().__init__()
         self.n_tokens = n_tokens
         self.role_embed = nn.Embedding(n_tokens, hidden)
@@ -248,7 +305,8 @@ class GroundedReflex(nn.Module):
                  freeze_backbone: bool = False,
                  adapter_mlp_ratio: int = 4,
                  embed_dim: int = EMBED_DIM,
-                 use_target_head: bool = False):
+                 use_target_head: bool = False,
+                 use_progress_state: bool = False):
         super().__init__()
         self.backbone = backbone
         self.hidden = hidden
@@ -260,7 +318,10 @@ class GroundedReflex(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
 
-        self.state_encoder = StateEncoder(hidden)
+        self.use_progress_state = bool(use_progress_state)
+        n_state_tokens = (N_STATE_TOKENS_ENRICHED if self.use_progress_state
+                           else N_STATE_TOKENS)
+        self.state_encoder = StateEncoder(hidden, n_tokens=n_state_tokens)
         self.kv_norm = nn.LayerNorm(hidden)
 
         layers = self._backbone_layers()
