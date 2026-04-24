@@ -108,7 +108,20 @@ def main():
     ap.add_argument('--sample-pool', type=int, default=300_000,
                     help='Subsample the flat cycle pool to this size, '
                     'balanced across families. 0 disables.')
+    ap.add_argument('--use-target-head', action='store_true',
+                    help='Path B: construct the model with the prompt-'
+                    'cross-attention TargetAwareHead. Gate-zero-init — '
+                    'at step 0 the head is a no-op identity.')
+    ap.add_argument('--freeze-except-target-head', action='store_true',
+                    help='Path B retrain: freeze the adapters + '
+                    'state_encoder + kv_norm so only the target head '
+                    'trains. Implies --use-target-head.')
+    ap.add_argument('--also-train-canonical-head', action='store_true',
+                    help='With --freeze-except-target-head, also '
+                    'unfreeze head_mlp + embed_head + instr_table.')
     args = ap.parse_args()
+    if args.freeze_except_target_head:
+        args.use_target_head = True
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     dtype = torch.bfloat16 if device == 'cuda' else torch.float32
@@ -212,7 +225,8 @@ def main():
                            inject_every=args.inject_every,
                            freeze_backbone=True,
                            adapter_mlp_ratio=args.adapter_mlp_ratio,
-                           embed_dim=args.embed_dim).to(device)
+                           embed_dim=args.embed_dim,
+                           use_target_head=args.use_target_head).to(device)
     # Seed the decode buffer so nearest-neighbour → real 32-bit word.
     with torch.no_grad():
         model.instr_words.copy_(
@@ -229,6 +243,28 @@ def main():
         ne_missing = [m for m in missing if not m.startswith('backbone.')]
         print(f'resumed from {args.resume}; new-module missing={len(ne_missing)} '
               f'unexpected={len(unexpected)}', flush=True)
+
+    if args.freeze_except_target_head:
+        # Freeze everything the canonical retrain normally leaves
+        # trainable (adapters, state_encoder, kv_norm) so only the
+        # target head's new cross-attention pathway trains. Optionally
+        # also unfreeze head_mlp + embed_head + instr_table when the
+        # downstream head needs to learn to consume the new signal.
+        if model.target_head is None:
+            raise SystemExit(
+                'target_head is None; did you build with --use-target-head?')
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for p in model.target_head.parameters():
+            p.requires_grad_(True)
+        if args.also_train_canonical_head:
+            for mod_name in ('head_mlp', 'embed_head', 'instr_table'):
+                for p in getattr(model, mod_name).parameters():
+                    p.requires_grad_(True)
+        frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+        trainable_cnt = sum(1 for p in model.parameters() if p.requires_grad)
+        print(f'Path-B freeze applied: {trainable_cnt} trainable tensors, '
+              f'{frozen} frozen', flush=True)
 
     new_params = [p for p in model.parameters() if p.requires_grad]
     n_new = sum(p.numel() for p in new_params) / 1e6
@@ -317,6 +353,7 @@ def main():
             'num_instrs': num_instrs,
             'chat_template': True,
             'context_prefix': False,
+            'use_target_head': args.use_target_head,
         }
 
     print(f'training {args.steps} steps batch={args.batch}  '
