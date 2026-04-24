@@ -30,12 +30,14 @@ from .pure import run as _run_pure
 from .tiebreak import run as _run_tiebreak
 from .exec_verify import run as _run_exec_verify
 from .beam import run as _run_beam
+from .rd_consistency import run as _run_rd_consistency
 
 DECODERS = {
-    'pure':        _run_pure,
-    'tiebreak':    _run_tiebreak,
-    'exec_verify': _run_exec_verify,
-    'beam':        _run_beam,
+    'pure':            _run_pure,
+    'tiebreak':        _run_tiebreak,
+    'exec_verify':     _run_exec_verify,
+    'beam':            _run_beam,
+    'rd_consistency':  _run_rd_consistency,
 }
 
 

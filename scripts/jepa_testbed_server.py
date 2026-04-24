@@ -44,13 +44,16 @@ from scripts.jepa_testbed import (
 TIER_MAP = {'short': SHORT, 'medium': MEDIUM, 'long': LONG, 'display': DISPLAY_TIER}
 
 DEFAULT_KWARGS = {
-    'pure':        {},
-    'tiebreak':    {'margin_eps': 0.15, 'halt_margin_eps': 0.30,
-                    'topk': 5, 'min_cycle': 2, 'max_interventions': 2},
-    'exec_verify': {'margin_eps': 0.15, 'topk': 4, 'min_cycle': 2,
-                    'max_interventions': 3, 'lookahead_depth': 6,
-                    'scoring': 'margin'},
-    'beam':        {'beam_width': 4, 'branching': 3},
+    'pure':            {},
+    'tiebreak':        {'margin_eps': 0.15, 'halt_margin_eps': 0.30,
+                        'topk': 5, 'min_cycle': 2, 'max_interventions': 2},
+    'exec_verify':     {'margin_eps': 0.15, 'topk': 4, 'min_cycle': 2,
+                        'max_interventions': 3, 'lookahead_depth': 6,
+                        'scoring': 'margin'},
+    'beam':            {'beam_width': 4, 'branching': 3},
+    'rd_consistency':  {'margin_eps': 0.15, 'halt_margin_eps': 0.35,
+                        'topk': 5, 'min_cycle': 2, 'lookback': 8,
+                        'max_interventions': 3},
 }
 
 
@@ -264,6 +267,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <label><input type="checkbox" class="dec" value="pure" checked> pure</label>
     <label><input type="checkbox" class="dec" value="tiebreak" checked> tiebreak</label>
     <label><input type="checkbox" class="dec" value="exec_verify" checked> exec_verify</label>
+    <label><input type="checkbox" class="dec" value="rd_consistency" checked> rd_consistency</label>
     <label><input type="checkbox" class="dec" value="beam"> beam <span class="flag">heavy</span></label>
   </div>
   <div style="margin-bottom:10px;"><strong style="color:#aab3bd">Tiers:</strong>
