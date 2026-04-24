@@ -48,10 +48,36 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
                  max_instr_tokens: int = MAX_INSTR_TOKENS,
                  use_chat_template: bool = True,
                  use_context_prefix: bool = False,
+                 decoder: str = 'pure',
+                 decoder_kwargs: dict | None = None,
                  ) -> tuple[Rv32i, list[int], bool, str]:
     """Drive one grounded-emission session for ``instruction``. Returns
     ``(cpu, emitted_words, halted, err_msg)``. Stops on HALT, on an
-    emitted zero word, or when ``max_cycles`` is exhausted."""
+    emitted zero word, or when ``max_cycles`` is exhausted.
+
+    The canonical path (``decoder='pure'``) is the thinnest-bridge
+    argmax snap this function has always run and is inlined below so
+    callers get bit-exact legacy behaviour without touching the
+    ``reflex.decoders`` subpackage.
+
+    Passing any other ``decoder`` name dispatches to the alternative
+    implementations in ``reflex.decoders`` — these deviate from the
+    canonical path in deliberate, documented ways. See ``CONFESSION.md``
+    at the repo root for the per-decoder rationale and the spiritual
+    cost of each deviation.
+    """
+    if decoder != 'pure':
+        from .decoders import get as _get_decoder
+        fn = _get_decoder(decoder)
+        kw = dict(decoder_kwargs or {})
+        kw.setdefault('max_instr_tokens', max_instr_tokens)
+        kw.setdefault('use_chat_template', use_chat_template)
+        kw.setdefault('use_context_prefix', use_context_prefix)
+        cpu, emitted, halted, err, _meta = fn(
+            model, tok, instruction, device, max_cycles,
+            seed_memcpy=seed_memcpy, **kw)
+        return cpu, emitted, halted, err
+    # Canonical path — bit-identical to the historical behaviour.
     text = render_prompt(tok, instruction,
                          use_chat_template=use_chat_template,
                          use_context_prefix=use_context_prefix)

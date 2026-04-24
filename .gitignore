@@ -20,3 +20,4 @@ wheels/
 .claude/
 *.pt
 checkpoints/
+latent_fidelity_results.html
