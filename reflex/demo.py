@@ -35,6 +35,7 @@ def load(ckpt_path: str, device: str = 'cuda'):
         inject_every=cfg.get('inject_every', INJECT_EVERY),
         adapter_mlp_ratio=cfg.get('adapter_mlp_ratio', 2),
         embed_dim=cfg.get('embed_dim', EMBED_DIM),
+        use_target_head=cfg.get('use_target_head', False),
         freeze_backbone=True).to(device)
     model.load_state_dict(ckpt['state'], strict=False)
     model.eval()
