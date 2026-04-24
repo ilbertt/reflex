@@ -76,13 +76,28 @@ def render_prompt(tok, task: str, use_chat_template: bool = True,
 # completes cleanly at only ~97% per-step top-1.
 EMBED_DIM = 256
 
-# State token layout (65 tokens total)
+# State token layout (65 tokens total in the canonical encoder)
 N_REGS = 32                     # tokens 0..31 = x0..x31
 IDX_PC = 32                     # token 32     = pc
 IDX_MEM_PC = 33                 # tokens 33..48 = 16 words around pc
 IDX_MEM_SP = 49                 # tokens 49..64 = 16 words around sp
 N_STATE_TOKENS = 65
 MEM_WINDOW_WORDS = 16
+
+# Path D (HEAD_STUDY.md) progress tokens — appended to the 65-token
+# canonical state when ``use_progress_state`` is enabled. Each slot is
+# a single uint32 carrying a monotone counter:
+#   slot 0  bytes_written_to_display  (count of nonzero bytes in 0x6000..0x6100)
+#   slot 1  words_written_to_data     (count of nonzero words in 0x5000..0x5100)
+#   slot 2  cycles_since_last_store   (0 on the cycle after a STORE; ramps)
+# Programs that write byte sequences to the display or data regions
+# produce a recognisable trajectory in these slots — the missing
+# "sequence-position" signal the display-tier failures need.
+N_PROGRESS_TOKENS = 3
+N_STATE_TOKENS_ENRICHED = N_STATE_TOKENS + N_PROGRESS_TOKENS
+IDX_PROGRESS_DISPLAY = N_STATE_TOKENS + 0
+IDX_PROGRESS_DATA    = N_STATE_TOKENS + 1
+IDX_PROGRESS_STORE   = N_STATE_TOKENS + 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -106,14 +121,50 @@ def _safe_read_words(cpu: Rv32i, center: int,
     return out
 
 
-def extract_state(cpu: Rv32i) -> np.ndarray:
-    """Returns a [65] uint32 state vector for the given Rv32i instance."""
+def extract_state(cpu: Rv32i, *,
+                  enriched: bool = False) -> np.ndarray:
+    """Returns a state vector for the given Rv32i instance.
+
+    If ``enriched=False`` (default — canonical checkpoint behaviour):
+        [65] uint32 vector as documented in the README.
+    If ``enriched=True`` (Path D retrain):
+        [68] uint32 vector = canonical 65 + 3 progress tokens. The
+        progress tokens are computed from CPU memory regions (no
+        history tracking required): display-byte count, data-word
+        count, and a synthetic "cycles since last store" slot that the
+        caller must maintain. When called without history, slot 2 is
+        set to 0 (treat as "just-after-store"); training and inference
+        loops should thread a counter through calls.
+    """
     regs = [cpu.reg(i) for i in range(N_REGS)]
     pc = cpu.pc
     sp = cpu.reg(2)                          # x2 = sp by ABI
     mem_pc = _safe_read_words(cpu, pc)
     mem_sp = _safe_read_words(cpu, sp)
-    return np.array(regs + [pc] + mem_pc + mem_sp, dtype=np.uint32)
+    base = regs + [pc] + mem_pc + mem_sp
+    if not enriched:
+        return np.array(base, dtype=np.uint32)
+
+    from .programs import DISPLAY_BASE
+    # Count nonzero bytes in the first 256 bytes of DISPLAY.
+    bytes_written = 0
+    try:
+        buf = bytes(cpu.uc.mem_read(DISPLAY_BASE, 256))
+        bytes_written = sum(1 for b in buf if b != 0)
+    except Exception:
+        pass
+    # Count nonzero words in the first 64 words of DATA.
+    data_words = 0
+    try:
+        buf = bytes(cpu.uc.mem_read(DATA_BASE, 256))
+        for i in range(0, 256, 4):
+            if int.from_bytes(buf[i:i+4], 'little') != 0:
+                data_words += 1
+    except Exception:
+        pass
+    # slot 2 left at 0; caller supplies via a separate path if needed.
+    progress = [bytes_written, data_words, 0]
+    return np.array(base + progress, dtype=np.uint32)
 
 
 # ── Modules ───────────────────────────────────────────────────────────
@@ -126,6 +177,12 @@ class StateEncoder(nn.Module):
     """
     def __init__(self, hidden: int, n_tokens: int = N_STATE_TOKENS,
                  byte_dim: int = 32):
+        """``n_tokens`` controls the K/V sequence length. 65 is the
+        canonical configuration. Set to 68 (``N_STATE_TOKENS_ENRICHED``)
+        when building a Path-D model that uses the progress-token
+        extension — the extra three slots share the same role-embedding
+        + value-projection machinery and initialise to random weights
+        just like the canonical tokens; retraining teaches them."""
         super().__init__()
         self.n_tokens = n_tokens
         self.role_embed = nn.Embedding(n_tokens, hidden)
@@ -143,6 +200,72 @@ class StateEncoder(nn.Module):
         val = self.value_proj(val_cat)                   # [B, N, hidden]
         roles = torch.arange(N, device=state_vals.device)[None].expand(B, N)
         return self.norm(val + self.role_embed(roles))
+
+
+class TargetAwareHead(nn.Module):
+    """Path B (HEAD_STUDY.md) — target-conditioned head.
+
+    The canonical JEPA head compresses the backbone's last-token pooled
+    hidden state into a 256-d codebook-neighbour prediction. That pooled
+    vector carries the prompt's target-intent only *implicitly* — as
+    the backbone's own summary. On low-margin cycles where the top-k
+    codebook neighbours are near-ties, implicit target-intent is not
+    enough to pick between semantically-different-but-valid candidates
+    (e.g., ``addi x15, 'K'`` vs ``addi x15, 'C'`` when the prompt
+    target is ``OK``).
+
+    This head adds an *explicit* second pathway: a cross-attention that
+    re-reads the backbone's own per-token hidden states, keyed on the
+    pooled state. The cross-attended vector is added to the pooled
+    feature through a tanh gate initialised to zero, so a checkpoint
+    constructed with this head but never retrained produces output
+    bit-identical to the canonical head. Retraining the head + the
+    cross-attention + the codebook (backbone + adapters stay frozen)
+    lets the head route prompt-target signal into the prediction
+    exactly where the pooled state alone is insufficient.
+    """
+    def __init__(self, hidden: int, embed_dim: int, n_heads: int = 8):
+        super().__init__()
+        self.hidden = hidden
+        self.embed_dim = embed_dim
+        self.prompt_norm = nn.LayerNorm(hidden)
+        self.q_proj = nn.Linear(hidden, hidden)
+        self.xattn = nn.MultiheadAttention(hidden, n_heads, batch_first=True)
+        self.out_proj = nn.Linear(hidden, hidden)
+        # tanh-initialised-to-zero gate: at step 0 the cross-attn
+        # contribution is exactly zero, so a non-retrained ckpt passes
+        # through the canonical head path.
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, pooled: torch.Tensor, prompt_hidden: torch.Tensor,
+                attention_mask: torch.Tensor) -> torch.Tensor:
+        """Returns a refined pooled vector [B, hidden].
+
+        ``pooled`` is the backbone's last-token pooled hidden state
+        ([B, H]). ``prompt_hidden`` is the backbone's full per-token
+        hidden-state output ([B, T, H]). ``attention_mask`` is the
+        standard HF mask where 1 is a real token, 0 is padding.
+        """
+        # Cast inputs to the head's parameter dtype. This lets the
+        # head hold its own weights in fp32 (the initial state after
+        # `nn.Linear(...)` / `nn.LayerNorm(...)` construction) while
+        # still accepting bf16 inputs from the upstream backbone
+        # forward. The result is cast back to the input dtype so
+        # downstream ``head_mlp`` receives the expected precision.
+        in_dtype = pooled.dtype
+        p_dtype = self.prompt_norm.weight.dtype
+        pooled_p = pooled.to(p_dtype)
+        prompt_p = prompt_hidden.to(p_dtype)
+
+        kv = self.prompt_norm(prompt_p)                      # [B, T, H]
+        q = self.q_proj(pooled_p).unsqueeze(1)               # [B, 1, H]
+        # key_padding_mask=True on positions to IGNORE.
+        kpm = (attention_mask == 0)
+        att, _ = self.xattn(q, kv, kv, key_padding_mask=kpm,
+                            need_weights=False)
+        delta = self.out_proj(att.squeeze(1))                # [B, H]
+        refined = pooled_p + torch.tanh(self.gate) * delta
+        return refined.to(in_dtype)
 
 
 class CrossAttnAdapter(nn.Module):
@@ -193,7 +316,9 @@ class GroundedReflex(nn.Module):
                  inject_every: int = INJECT_EVERY,
                  freeze_backbone: bool = False,
                  adapter_mlp_ratio: int = 4,
-                 embed_dim: int = EMBED_DIM):
+                 embed_dim: int = EMBED_DIM,
+                 use_target_head: bool = False,
+                 use_progress_state: bool = False):
         super().__init__()
         self.backbone = backbone
         self.hidden = hidden
@@ -205,7 +330,10 @@ class GroundedReflex(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
 
-        self.state_encoder = StateEncoder(hidden)
+        self.use_progress_state = bool(use_progress_state)
+        n_state_tokens = (N_STATE_TOKENS_ENRICHED if self.use_progress_state
+                           else N_STATE_TOKENS)
+        self.state_encoder = StateEncoder(hidden, n_tokens=n_state_tokens)
         self.kv_norm = nn.LayerNorm(hidden)
 
         layers = self._backbone_layers()
@@ -220,6 +348,16 @@ class GroundedReflex(nn.Module):
             nn.Linear(hidden, hidden),
         )
         self.embed_head = nn.Linear(hidden, embed_dim)
+
+        # Path B: target-conditioned head. Constructed only when
+        # requested at build time. Gate is zero-initialised so a
+        # freshly-added head on an un-retrained checkpoint has no
+        # effect — cosine output remains bit-identical until the head
+        # is trained.
+        self.use_target_head = bool(use_target_head)
+        self.target_head = (
+            TargetAwareHead(hidden, embed_dim) if self.use_target_head else None
+        )
 
         # JEPA instruction codebook: one trainable embedding per unique
         # 32-bit word observed in training. ``instr_words`` is the
@@ -274,17 +412,42 @@ class GroundedReflex(nn.Module):
         """Returns [B, embed_dim] predicted instruction embedding."""
         kv = self.kv_norm(self.state_encoder(state_vals))    # [B, 65, H]
         self._current_kv = kv
+        # When nothing upstream of the head-output is trainable
+        # (Path B retrain: adapters, state_encoder, kv_norm all
+        # frozen), run the backbone under ``torch.no_grad()`` so
+        # the transformer layers don't retain activations for a
+        # backward pass that never reaches them. Frees ~6 GB at
+        # batch 16 seq_len 96 on Qwen-7B and lets 24 GB 3090s fit.
+        no_grad_backbone = getattr(self, 'detach_backbone_output', False)
         try:
-            out = self.backbone(input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                output_hidden_states=False,
-                                return_dict=True, use_cache=False)
+            if no_grad_backbone:
+                with torch.no_grad():
+                    out = self.backbone(input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        output_hidden_states=False,
+                                        return_dict=True, use_cache=False)
+            else:
+                out = self.backbone(input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                    output_hidden_states=False,
+                                    return_dict=True, use_cache=False)
         finally:
             self._current_kv = None
         head_dtype = next(self.head_mlp.parameters()).dtype
         h = out.last_hidden_state.to(head_dtype)
+        # Ensure ``h`` is a leaf tensor with requires_grad flipped on
+        # so downstream trainable params (target_head, head_mlp, etc.)
+        # can still backprop through operations applied to h. The
+        # backbone's internal grad graph was already skipped above.
+        if no_grad_backbone:
+            h = h.detach().requires_grad_(True)
         last_idx = attention_mask.sum(dim=1).long() - 1      # [B]
         pooled = h[torch.arange(h.size(0), device=h.device), last_idx]
+        if self.target_head is not None:
+            # Path B: refine pooled with prompt cross-attention before
+            # the head_mlp. Gate-zero-init means this is identity on
+            # un-retrained checkpoints.
+            pooled = self.target_head(pooled, h, attention_mask)
         feat = self.head_mlp(pooled)
         return self.embed_head(feat)                         # [B, embed_dim]
 

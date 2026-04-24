@@ -20,3 +20,7 @@ wheels/
 .claude/
 *.pt
 checkpoints/
+latent_fidelity_results.html
+reflex_target_head.pt
+reflex_target_head_only.pt
+reflex_th_plus_headmlp.pt

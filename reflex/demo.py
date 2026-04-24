@@ -35,6 +35,8 @@ def load(ckpt_path: str, device: str = 'cuda'):
         inject_every=cfg.get('inject_every', INJECT_EVERY),
         adapter_mlp_ratio=cfg.get('adapter_mlp_ratio', 2),
         embed_dim=cfg.get('embed_dim', EMBED_DIM),
+        use_target_head=cfg.get('use_target_head', False),
+        use_progress_state=cfg.get('use_progress_state', False),
         freeze_backbone=True).to(device)
     model.load_state_dict(ckpt['state'], strict=False)
     model.eval()
@@ -48,10 +50,36 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
                  max_instr_tokens: int = MAX_INSTR_TOKENS,
                  use_chat_template: bool = True,
                  use_context_prefix: bool = False,
+                 decoder: str = 'pure',
+                 decoder_kwargs: dict | None = None,
                  ) -> tuple[Rv32i, list[int], bool, str]:
     """Drive one grounded-emission session for ``instruction``. Returns
     ``(cpu, emitted_words, halted, err_msg)``. Stops on HALT, on an
-    emitted zero word, or when ``max_cycles`` is exhausted."""
+    emitted zero word, or when ``max_cycles`` is exhausted.
+
+    The canonical path (``decoder='pure'``) is the thinnest-bridge
+    argmax snap this function has always run and is inlined below so
+    callers get bit-exact legacy behaviour without touching the
+    ``reflex.decoders`` subpackage.
+
+    Passing any other ``decoder`` name dispatches to the alternative
+    implementations in ``reflex.decoders`` — these deviate from the
+    canonical path in deliberate, documented ways. See ``CONFESSION.md``
+    at the repo root for the per-decoder rationale and the spiritual
+    cost of each deviation.
+    """
+    if decoder != 'pure':
+        from .decoders import get as _get_decoder
+        fn = _get_decoder(decoder)
+        kw = dict(decoder_kwargs or {})
+        kw.setdefault('max_instr_tokens', max_instr_tokens)
+        kw.setdefault('use_chat_template', use_chat_template)
+        kw.setdefault('use_context_prefix', use_context_prefix)
+        cpu, emitted, halted, err, _meta = fn(
+            model, tok, instruction, device, max_cycles,
+            seed_memcpy=seed_memcpy, **kw)
+        return cpu, emitted, halted, err
+    # Canonical path — bit-identical to the historical behaviour.
     text = render_prompt(tok, instruction,
                          use_chat_template=use_chat_template,
                          use_context_prefix=use_context_prefix)
@@ -68,9 +96,12 @@ def run_grounded(model, tok, instruction: str, device: str = 'cuda',
     emitted: list[int] = []
     halted = False
     err = ''
+    # Path D: when the loaded model was built with progress-state
+    # enrichment, the state encoder expects 68 tokens instead of 65.
+    enriched = bool(getattr(model, 'use_progress_state', False))
     for cycle in range(max_cycles):
         pc = cpu.pc
-        state = extract_state(cpu)
+        state = extract_state(cpu, enriched=enriched)
         state_t = torch.from_numpy(state.astype('int64')).unsqueeze(0).to(device)
         pred = model(ids, amask, state_t)
         instr_w = int(model.decode_words(pred).item()) & 0xFFFFFFFF
